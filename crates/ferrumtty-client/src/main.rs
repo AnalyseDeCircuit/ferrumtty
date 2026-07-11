@@ -174,6 +174,7 @@ fn event_loop(
     result
 }
 
+#[cfg(not(windows))]
 fn install_termination_flag() -> Result<Arc<AtomicBool>, String> {
     let requested = Arc::new(AtomicBool::new(false));
     for signal in signal_hook::consts::TERM_SIGNALS {
@@ -181,6 +182,15 @@ fn install_termination_flag() -> Result<Arc<AtomicBool>, String> {
             .map_err(|error| format!("{}: {error}", text(Text::SignalSetupFailed)))?;
     }
     Ok(requested)
+}
+
+#[cfg(windows)]
+fn install_termination_flag() -> Result<Arc<AtomicBool>, String> {
+    // ConPTY can raise a control event while also delivering the key as input.
+    // Ignoring the process-level event lets Ctrl+C reach the remote session.
+    ctrlc::set_handler(|| {})
+        .map_err(|error| format!("{}: {error}", text(Text::SignalSetupFailed)))?;
+    Ok(Arc::new(AtomicBool::new(false)))
 }
 
 fn drain_network(

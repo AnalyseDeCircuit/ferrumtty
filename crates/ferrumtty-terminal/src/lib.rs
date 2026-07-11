@@ -5,9 +5,13 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ferrumtty_wire::{ByteRun, Instruction, ViewportSize};
+use std::env;
 use std::io::{self, Write};
 
 const DEFAULT_ESCAPE_BYTE: u8 = 0x1e;
+const COLUMNS_ENVIRONMENT_VARIABLE: &str = "COLUMNS";
+const LINES_ENVIRONMENT_VARIABLE: &str = "LINES";
+const SKIP_TERMINAL_INITIALIZATION_VARIABLE: &str = "MOSH_NO_TERM_INIT";
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum EscapeAction {
@@ -60,6 +64,7 @@ impl EscapeInterpreter {
 pub struct TerminalGuard {
     output: io::Stdout,
     authoritative: AuthoritativeScreen,
+    alternate_screen_active: bool,
 }
 
 impl TerminalGuard {
@@ -72,17 +77,29 @@ impl TerminalGuard {
         let (columns, rows) = terminal_size()?;
         enable_raw_mode()?;
         let mut output = io::stdout();
-        if let Err(error) = crossterm::execute!(
-            output,
-            crossterm::event::EnableBracketedPaste,
-            crossterm::cursor::SavePosition
-        ) {
+        let alternate_screen_active = env::var_os(SKIP_TERMINAL_INITIALIZATION_VARIABLE).is_none();
+        let setup_result = if alternate_screen_active {
+            crossterm::execute!(
+                output,
+                crossterm::terminal::EnterAlternateScreen,
+                crossterm::event::EnableBracketedPaste
+            )
+            .and_then(|()| output.write_all(b"\x1b[?1h"))
+            .and_then(|()| output.flush())
+        } else {
+            crossterm::execute!(output, crossterm::event::EnableBracketedPaste)
+        };
+        if let Err(error) = setup_result {
+            if alternate_screen_active {
+                let _ = crossterm::execute!(output, crossterm::terminal::LeaveAlternateScreen);
+            }
             let _ = disable_raw_mode();
             return Err(error);
         }
         Ok(Self {
             output,
             authoritative: AuthoritativeScreen::new(columns, rows),
+            alternate_screen_active,
         })
     }
 
@@ -133,7 +150,24 @@ impl TerminalGuard {
 ///
 /// Returns an operating-system error when the console size is unavailable.
 pub fn terminal_size() -> io::Result<(u16, u16)> {
-    crossterm::terminal::size().map(|(columns, rows)| (columns.max(1), rows.max(1)))
+    match crossterm::terminal::size() {
+        Ok((columns, rows)) => Ok((columns.max(1), rows.max(1))),
+        Err(console_error) => environment_terminal_size().ok_or(console_error),
+    }
+}
+
+fn environment_terminal_size() -> Option<(u16, u16)> {
+    let columns = env::var(COLUMNS_ENVIRONMENT_VARIABLE)
+        .ok()?
+        .parse::<u16>()
+        .ok()?
+        .max(1);
+    let rows = env::var(LINES_ENVIRONMENT_VARIABLE)
+        .ok()?
+        .parse::<u16>()
+        .ok()?
+        .max(1);
+    Some((columns, rows))
 }
 
 struct AuthoritativeScreen {
@@ -166,9 +200,12 @@ impl Drop for TerminalGuard {
             self.output,
             crossterm::event::DisableBracketedPaste,
             crossterm::event::DisableMouseCapture,
-            crossterm::event::DisableFocusChange,
-            crossterm::cursor::RestorePosition
+            crossterm::event::DisableFocusChange
         );
+        if self.alternate_screen_active {
+            let _ = self.output.write_all(b"\x1b[?1l");
+            let _ = crossterm::execute!(self.output, crossterm::terminal::LeaveAlternateScreen);
+        }
         let _ = disable_raw_mode();
     }
 }

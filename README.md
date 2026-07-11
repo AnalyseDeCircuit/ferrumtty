@@ -68,6 +68,11 @@ placing it in command-line arguments.
 | `Ctrl-^ .` | End the local session |
 | `Ctrl-^ ^` | Send a literal `Ctrl-^` |
 
+FerrumTTY uses the local alternate screen by default so the original terminal
+contents return after exit. Set `MOSH_NO_TERM_INIT=1` to keep the current screen.
+If the operating system cannot report the viewport, positive `COLUMNS` and
+`LINES` environment variables are used as a fallback.
+
 ## What works
 
 - AES-128 OCB3 authenticated datagrams
@@ -81,6 +86,12 @@ placing it in command-line arguments.
 - Terminal restoration after exit, error, panic unwinding, and supported signals
 - English and Simplified Chinese command-line diagnostics
 - Native source checks for macOS, Linux, and Windows targets
+- Static MSVC runtime in Windows release binaries
+
+On Windows, console control events for Ctrl+C and Ctrl+Break are ignored by the
+local process so their input can be forwarded to the remote session. This path
+is compile-checked in CI but has not yet been claimed as end-to-end validated
+under every Windows terminal host.
 
 ## Architecture
 

@@ -22,6 +22,30 @@ jobs:
           components: clippy
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Check Windows runtime dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --locked --package ferrumtty-client
+          $executable = (Resolve-Path "target/release/ferrumtty.exe").Path
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find "**/Hostx64/x64/dumpbin.exe" |
+            Select-Object -First 1
+          if (-not $dumpbin) {
+            throw "dumpbin.exe was not found"
+          }
+          $imports = & $dumpbin /dependents $executable
+          $redistributablePatterns = @(
+            'VCRUNTIME140(_1)?\.dll',
+            'MSVCP140\.dll',
+            'ucrtbase\.dll',
+            'api-ms-win-crt-[A-Za-z0-9_-]+\.dll'
+          )
+          foreach ($pattern in $redistributablePatterns) {
+            if ($imports -match $pattern) {
+              throw "Windows executable imports a redistributable CRT dependency matching $pattern"
+            }
+          }
 
   cross-check:
     strategy:

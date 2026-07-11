@@ -16,8 +16,13 @@ ferrumtty-crypto = { version = "=0.0.0", path = "../ferrumtty-crypto" }
 ferrumtty-predict = { version = "=0.0.0", path = "../ferrumtty-predict" }
 ferrumtty-runtime = { version = "=0.0.0", path = "../ferrumtty-runtime" }
 ferrumtty-terminal = { version = "=0.0.0", path = "../ferrumtty-terminal" }
-signal-hook.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+ctrlc.workspace = true
 
 [lints]
 workspace = true

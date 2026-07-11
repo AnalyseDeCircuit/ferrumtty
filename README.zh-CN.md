@@ -65,6 +65,10 @@ MOSH CONNECT 60001 SESSION_KEY
 | `Ctrl-^ .` | 结束本地会话 |
 | `Ctrl-^ ^` | 发送字面量 `Ctrl-^` |
 
+FerrumTTY 默认使用本地备用屏幕，以便退出后恢复原有终端内容。设置
+`MOSH_NO_TERM_INIT=1` 可保留当前屏幕。如果操作系统无法报告窗口尺寸，
+程序会使用合法的 `COLUMNS` 和 `LINES` 环境变量作为后备值。
+
 ## 已支持功能
 
 - AES-128 OCB3 数据报认证
@@ -78,6 +82,11 @@ MOSH CONNECT 60001 SESSION_KEY
 - 在退出、错误、panic 展开和受支持信号后恢复终端
 - 英文与简体中文命令行诊断
 - 对 macOS、Linux 和 Windows 目标执行原生源码检查
+- Windows 发布程序静态链接 MSVC 运行库
+
+在 Windows 上，本地进程会忽略 Ctrl+C 和 Ctrl+Break 的控制台控制事件，
+以便将相应输入转发给远端会话。持续集成会检查这条代码路径能够编译，
+但项目目前尚未宣称它已经在所有 Windows 终端宿主中完成端到端验证。
 
 ## 架构
 
