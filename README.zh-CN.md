@@ -165,10 +165,11 @@ Release 创建。
 - [净室政策](docs/CLEAN_ROOM.md)
 - [嵌入契约](docs/EMBEDDING.md)
 - [预测策略](docs/PREDICTION.md)
+- [项目治理与额外许可](GOVERNANCE.md)
 - [第三方通知](THIRD-PARTY-NOTICES.md)
 
 ## 许可证与独立性
 
 FerrumTTY 采用 [GPL-3.0-only](LICENSE) 许可证。它是独立的净室实现，
-与 Mosh 项目不存在关联，也未获得其认可。Mosh 是其相应权利人的注册
-商标。
+与 Mosh 项目不存在关联，也未获得其认可。版权所有者的额外许可政策详见
+[项目治理文件](GOVERNANCE.md)。Mosh 是其相应权利人的注册商标。

@@ -170,10 +170,13 @@ platform build prevents the GitHub Release from being created.
 - [Clean-room policy](docs/CLEAN_ROOM.md)
 - [Embedding contract](docs/EMBEDDING.md)
 - [Prediction policy](docs/PREDICTION.md)
+- [Project governance and additional licensing](GOVERNANCE.md)
 - [Third-party notices](THIRD-PARTY-NOTICES.md)
 
 ## License and independence
 
 FerrumTTY is licensed under [GPL-3.0-only](LICENSE). It is an independent
 clean-room implementation and is not affiliated with or endorsed by the Mosh
-project. Mosh is a registered trademark of its respective owner.
+project. The copyright holder's additional-licensing policy is described in
+[the project governance document](GOVERNANCE.md). Mosh is a registered
+trademark of its respective owner.
