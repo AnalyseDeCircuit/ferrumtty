@@ -1,101 +1,155 @@
 <div align="center">
-  <img src="assets/ferrumtty-icon.png" width="180" alt="FerrumTTY icon">
+  <img src="assets/ferrumtty-icon.png" width="168" alt="FerrumTTY icon">
   <h1>FerrumTTY</h1>
-  <p><strong>A pure-Rust client for resilient remote terminal sessions.</strong></p>
+  <p><strong>A pure-Rust terminal client that keeps working when the network does not.</strong></p>
+
+  <p>
+    <img alt="Rust 1.85+" src="https://img.shields.io/badge/Rust-1.85%2B-b7410e?logo=rust">
+    <img alt="GPL-3.0-only" src="https://img.shields.io/badge/license-GPL--3.0--only-blue">
+    <img alt="macOS, Linux, Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-333">
+    <img alt="mosh-server 1.4.0" src="https://img.shields.io/badge/tested%20with-mosh--server%201.4.0-orange">
+  </p>
+
   <p>English · <a href="README.zh-CN.md">简体中文</a></p>
 </div>
 
-FerrumTTY is an independent, cross-platform remote terminal client compatible
-with the standard `mosh-server` wire protocol. It is written in pure Rust and
-licensed under GPL-3.0-only.
+FerrumTTY is an independent client for the standard `mosh-server` wire
+protocol. It combines authenticated UDP state synchronization, network roaming,
+terminal handling, and conservative local prediction in a Rust-only codebase.
 
-The current verified compatibility baseline is `mosh-server` 1.4.0. FerrumTTY
-accepts an endpoint and ephemeral session key from an external SSH or
-host-application bootstrap, then runs the authenticated UDP session.
+It is designed to be useful in two places:
 
-## Features
+- as a standalone network client launched after an SSH bootstrap;
+- as an embeddable runtime inside another terminal or host application.
 
-- Pure-Rust protocol, cryptography integration, compression, and terminal path
+> **Project status:** the protocol path interoperates with the unmodified Debian
+> `mosh-server` 1.4.0 package. The API is still pre-release and compatibility
+> claims are deliberately limited to exact versions tested in the lab.
+
+## Why FerrumTTY?
+
+Remote shells tend to feel worst exactly when they matter most: on mobile
+networks, unstable Wi-Fi, VPN transitions, and machines waking from sleep.
+FerrumTTY synchronizes terminal state over authenticated UDP instead of treating
+the session as one fragile byte stream.
+
+- **Roaming:** continue after the client address or UDP source port changes.
+- **Loss recovery:** retransmit logical state without reusing packet nonces.
+- **Fast feedback:** predict only safe printable input and roll it back against
+  the authoritative server screen.
+- **Native integration:** embed the protocol runtime without giving it control
+  of SSH, sockets, clocks, or credentials.
+- **Portable Rust:** no bundled C or C++ protocol runtime.
+
+## Quick start
+
+FerrumTTY starts after a standard server has supplied a UDP port and ephemeral
+key. An SSH command, terminal manager, or another host application can perform
+that bootstrap.
+
+```console
+$ cargo build --release --package ferrumtty-client
+$ MOSH_KEY='SESSION_KEY' ./target/release/ferrumtty SERVER_IP UDP_PORT
+```
+
+For example, a bootstrap typically obtains a line shaped like:
+
+```text
+MOSH CONNECT 60001 SESSION_KEY
+```
+
+Pass the port and key directly to FerrumTTY without writing the key to disk or
+placing it in command-line arguments.
+
+### Local escape
+
+| Keys | Action |
+| --- | --- |
+| `Ctrl-^ .` | End the local session |
+| `Ctrl-^ ^` | Send a literal `Ctrl-^` |
+
+## What works
+
 - AES-128 OCB3 authenticated datagrams
-- Acknowledgements, retransmission, heartbeat, and bounded replay handling
-- Session continuity across client address and UDP source-port changes
-- IPv4 and IPv6 endpoint support
-- UTF-8 output, keyboard, mouse, focus, bracketed paste, and resize handling
-- Conservative local prediction with authoritative-screen rollback
-- Terminal restoration after normal exit, local escape, errors, and supported
-  termination signals
-- Embeddable runtime that does not own SSH, sockets, clocks, or credentials
-- Source checks for macOS, Linux, and Windows targets
+- Bounded packet replay window and fragment reassembly
+- Acknowledgements, retransmission backoff, heartbeat, and timeout
+- IPv4 and IPv6 endpoints
+- Client UDP rebinding and suspend/resume recovery
+- UTF-8 terminal output and authoritative VT screen tracking
+- Keyboard, function keys, mouse, focus, bracketed paste, and resize
+- Conservative local prediction with full authoritative rollback
+- Terminal restoration after exit, error, panic unwinding, and supported signals
+- English and Simplified Chinese command-line diagnostics
+- Native source checks for macOS, Linux, and Windows targets
 
-## Status and compatibility
+## Architecture
 
-FerrumTTY has completed bidirectional interoperability tests against the
-unmodified Debian `mosh-server` package `1.4.0-1+b1` on arm64. Tests cover
-authenticated state exchange, injected packet loss, retransmission, reordering,
-and client UDP rebinding.
+The workspace keeps protocol concerns separate from operating-system concerns:
 
-Compatibility claims are limited to exact server versions tested by the
-checked-in laboratory. See [Compatibility](docs/COMPATIBILITY.md) for the
-artifact identity and current platform limits.
+| Crate | Responsibility |
+| --- | --- |
+| `ferrumtty-wire` | Fragment framing, bounded Protobuf decoding, and compression |
+| `ferrumtty-crypto` | Session-key ownership and OCB3 packet envelopes |
+| `ferrumtty-session` | State numbers, acknowledgements, replay handling, and reassembly |
+| `ferrumtty-runtime` | Deterministic timers, queues, retransmission, and host actions |
+| `ferrumtty-terminal` | Terminal lifecycle and input encoding |
+| `ferrumtty-predict` | Non-authoritative local prediction overlay |
+| `ferrumtty-client` | UDP and local-console command-line application |
+| `ferrumtty-lab` | Black-box compatibility probes and synthetic fixtures |
 
-## Run from source
+The embeddable API is described in [docs/EMBEDDING.md](docs/EMBEDDING.md).
 
-FerrumTTY expects the conventional `MOSH_KEY` environment variable plus the
-server host and UDP port:
+## Compatibility
 
-```sh
-MOSH_KEY='REDACTED' cargo run --release --package ferrumtty-client -- HOST PORT
+The checked-in laboratory verifies FerrumTTY against Debian
+`mosh-server 1.4.0-1+b1` on arm64. It exercises bidirectional state exchange,
+packet loss, retransmission, reordering, and UDP rebinding.
+
+```console
+$ ./lab/verify-ferrumtty-to-standard-server.sh
+standard server exchanged FerrumTTY state: ... roamed=true
 ```
 
-The primary executable is `ferrumtty`. Release archives also include a
-`mosh-client` compatibility copy for existing external bootstrap integrations.
+See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the pinned artifact and
+the exact scope of the compatibility claim.
 
-## Local escape
+## Development
 
-- `Ctrl-^ .` ends the local session.
-- `Ctrl-^ ^` sends a literal `Ctrl-^` to the remote application.
+Rust 1.85 or later is required.
 
-## Build and test
-
-The workspace requires Rust 1.85 or later.
-
-```sh
-cargo build --workspace --locked
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
+```console
+$ cargo build --workspace --locked
+$ cargo test --workspace --locked
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+$ cargo deny check
 ```
 
-Run the standard-server and terminal lifecycle checks:
+Run the real PTY lifecycle check:
 
-```sh
-./lab/verify-ferrumtty-to-standard-server.sh
-./lab/verify-terminal-restoration.exp
+```console
+$ cargo build --package ferrumtty-client
+$ ./lab/verify-terminal-restoration.exp
 ```
 
-Build a release archive containing the executable, compatibility command,
-license, notices, and checksum:
+Create a self-contained release archive:
 
-```sh
-./scripts/package-release.sh 0.1.0 aarch64-apple-darwin
+```console
+$ ./scripts/package-release.sh 0.1.0 aarch64-apple-darwin
 ```
 
-## Embedding
-
-`ferrumtty-runtime` exposes deterministic input, resize, datagram, timer, and
-terminal-output actions. A host application remains responsible for SSH
-bootstrap, UDP transport, monotonic time, terminal presentation, and credential
-ownership. See the [embedding contract](docs/EMBEDDING.md).
+The archive contains `ferrumtty`, a `mosh-client` compatibility copy, the
+license, copyright notice, third-party notices, and a SHA-256 checksum.
 
 ## Documentation
 
-- [Compatibility](docs/COMPATIBILITY.md)
+- [Compatibility and tested artifact](docs/COMPATIBILITY.md)
 - [Clean-room policy](docs/CLEAN_ROOM.md)
-- [Embedding API](docs/EMBEDDING.md)
-- [Prediction behavior](docs/PREDICTION.md)
+- [Embedding contract](docs/EMBEDDING.md)
+- [Prediction policy](docs/PREDICTION.md)
 - [Third-party notices](THIRD-PARTY-NOTICES.md)
 
-## Independence and trademark notice
+## License and independence
 
-FerrumTTY is an independent clean-room implementation. It is not affiliated
-with or endorsed by the Mosh project. Mosh is a registered trademark of its
-respective owner.
+FerrumTTY is licensed under [GPL-3.0-only](LICENSE). It is an independent
+clean-room implementation and is not affiliated with or endorsed by the Mosh
+project. Mosh is a registered trademark of its respective owner.
