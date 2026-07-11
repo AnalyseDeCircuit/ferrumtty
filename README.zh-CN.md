@@ -137,6 +137,19 @@ $ ./scripts/package-release.sh 0.1.0 aarch64-apple-darwin
 归档包含 `ferrumtty`、`mosh-client` 兼容副本、许可证、版权声明、第三方
 通知和 SHA-256 校验和。
 
+### GitHub 发布
+
+推送语义化版本标签后，GitHub 会为 Linux x86_64/arm64、macOS
+x86_64/arm64 和 Windows x86_64 构建原生归档，随后自动创建 Release：
+
+```console
+$ git tag -a v0.1.0 -m "FerrumTTY 0.1.0"
+$ git push origin v0.1.0
+```
+
+发布流程会先运行测试和 Clippy 检查。任何平台构建失败都会阻止 GitHub
+Release 创建。
+
 ## 文档
 
 - [兼容性与测试软件包](docs/COMPATIBILITY.md)

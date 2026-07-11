@@ -140,6 +140,19 @@ $ ./scripts/package-release.sh 0.1.0 aarch64-apple-darwin
 The archive contains `ferrumtty`, a `mosh-client` compatibility copy, the
 license, copyright notice, third-party notices, and a SHA-256 checksum.
 
+### GitHub releases
+
+Pushing a semantic version tag builds native archives for Linux x86_64/arm64,
+macOS x86_64/arm64, and Windows x86_64, then publishes them to a GitHub Release:
+
+```console
+$ git tag -a v0.1.0 -m "FerrumTTY 0.1.0"
+$ git push origin v0.1.0
+```
+
+The release workflow runs the test and Clippy gates before packaging. A failed
+platform build prevents the GitHub Release from being created.
+
 ## Documentation
 
 - [Compatibility and tested artifact](docs/COMPATIBILITY.md)

@@ -27,7 +27,7 @@ case ${target} in
     *-windows-*) cp "${staging_root}/${executable_name}" "${staging_root}/mosh-client.exe" ;;
     *) cp "${staging_root}/${executable_name}" "${staging_root}/mosh-client" ;;
 esac
-cp LICENSE COPYRIGHT README.md THIRD-PARTY-NOTICES.md "${staging_root}/"
+cp LICENSE COPYRIGHT README.md README.zh-CN.md THIRD-PARTY-NOTICES.md "${staging_root}/"
 
 tar -C dist -czf "dist/${archive_name}.tar.gz" "${archive_name}"
 shasum -a 256 "dist/${archive_name}.tar.gz" >"dist/${archive_name}.tar.gz.sha256"
