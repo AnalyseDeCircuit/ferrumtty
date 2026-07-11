@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/ferrumtty-icon.png" width="168" alt="FerrumTTY icon">
   <h1>FerrumTTY</h1>
-  <p><strong>A pure-Rust terminal client that keeps working when the network does not.</strong></p>
+  <p><strong>A pure-Rust Mosh client for stock mosh-server.</strong></p>
 
   <p>
     <img alt="Rust 1.85+" src="https://img.shields.io/badge/Rust-1.85%2B-b7410e?logo=rust">
@@ -13,9 +13,11 @@
   <p>English · <a href="README.zh-CN.md">简体中文</a></p>
 </div>
 
-FerrumTTY is an independent client for the standard `mosh-server` wire
-protocol. It combines authenticated UDP state synchronization, network roaming,
-terminal handling, and conservative local prediction in a Rust-only codebase.
+**FerrumTTY is an independent, pure-Rust [Mosh](https://mosh.org/) client.** It
+speaks the standard Mosh wire protocol directly to an unmodified `mosh-server`,
+including AES-128-OCB3 authenticated datagrams, state synchronization,
+fragmentation, acknowledgements, roaming, and terminal paint instructions.
+It does not contain an SSH client or a Mosh server.
 
 It is designed to be useful in two places:
 
@@ -25,6 +27,33 @@ It is designed to be useful in two places:
 > **Project status:** the protocol path interoperates with the unmodified Debian
 > `mosh-server` 1.4.0 package. The API is still pre-release and compatibility
 > claims are deliberately limited to exact versions tested in the lab.
+
+## Mosh compatibility
+
+FerrumTTY occupies the same network-client position as the conventional
+`mosh-client` executable. SSH is used only to start the remote server and obtain
+the `MOSH CONNECT` port and session key; FerrumTTY then runs the Mosh session
+over authenticated UDP.
+
+```text
+SSH or host application
+        │  MOSH CONNECT <port> <key>
+        ▼
+FerrumTTY / mosh-client
+        │  Mosh protocol over authenticated UDP
+        ▼
+stock mosh-server 1.4.x
+```
+
+The current compatibility target is the standard Mosh 1.4.x protocol family.
+Automated black-box interoperability is presently pinned to the unmodified
+Debian `mosh-server` 1.4.0 package; other 1.4.x releases remain compatibility
+targets until individually recorded in the lab.
+
+Release archives include both `ferrumtty` and a `mosh-client`-named copy for
+SSH bootstrap tools and terminal applications that expect that executable
+name. The reusable runtime can also be embedded directly into applications
+such as terminal emulators.
 
 ## Why FerrumTTY?
 

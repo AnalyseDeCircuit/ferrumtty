@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/ferrumtty-icon.png" width="168" alt="FerrumTTY 图标">
   <h1>FerrumTTY</h1>
-  <p><strong>网络不稳定时仍能继续工作的纯 Rust 终端客户端。</strong></p>
+  <p><strong>面向标准 mosh-server 的纯 Rust Mosh 客户端。</strong></p>
 
   <p>
     <img alt="Rust 1.85+" src="https://img.shields.io/badge/Rust-1.85%2B-b7410e?logo=rust">
@@ -13,9 +13,10 @@
   <p><a href="README.md">English</a> · 简体中文</p>
 </div>
 
-FerrumTTY 是标准 `mosh-server` 线协议的独立客户端。它在纯 Rust
-代码库中实现经过身份认证的 UDP 状态同步、网络漫游、终端处理和保守的
-本地预测。
+**FerrumTTY 是独立实现的纯 Rust [Mosh](https://mosh.org/) 客户端。**
+它直接使用标准 Mosh 线协议连接未经修改的 `mosh-server`，覆盖
+AES-128-OCB3 认证数据报、状态同步、分片、确认、网络漫游和终端绘制指令。
+FerrumTTY 本身不包含 SSH 客户端或 Mosh 服务端。
 
 它适合两类使用方式：
 
@@ -25,6 +26,30 @@ FerrumTTY 是标准 `mosh-server` 线协议的独立客户端。它在纯 Rust
 > **项目状态：** 当前协议链路已经与未经修改的 Debian
 > `mosh-server` 1.4.0 软件包完成互操作。API 仍处于预发布阶段，兼容性
 > 声明仅覆盖实验室实际测试过的精确版本。
+
+## Mosh 兼容性
+
+FerrumTTY 所处的位置与传统 `mosh-client` 可执行程序相同。SSH 仅用于启动
+远端服务并取得 `MOSH CONNECT` 返回的端口与会话密钥；随后 FerrumTTY 通过
+经过身份认证的 UDP 运行 Mosh 会话。
+
+```text
+SSH 或宿主应用
+      │  MOSH CONNECT <端口> <密钥>
+      ▼
+FerrumTTY / mosh-client
+      │  基于认证 UDP 的 Mosh 协议
+      ▼
+标准 mosh-server 1.4.x
+```
+
+当前兼容目标是标准 Mosh 1.4.x 协议系列。自动化黑盒互操作目前固定使用
+未经修改的 Debian `mosh-server` 1.4.0 软件包；在实验室逐一留下记录前，
+其他 1.4.x 版本仍属于兼容目标，而不是已经验证的版本。
+
+发布归档同时提供 `ferrumtty` 和名为 `mosh-client` 的兼容副本，便于接入
+依赖该可执行文件名的 SSH 启动器与终端应用。终端模拟器等宿主也可以直接
+嵌入可复用的运行时。
 
 ## 为什么选择 FerrumTTY？
 
