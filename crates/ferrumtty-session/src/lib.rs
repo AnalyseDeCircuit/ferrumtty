@@ -131,7 +131,6 @@ impl ClientProtocol {
         };
         self.assemblies.remove(&header.state_id);
         let update = decode_compressed_update(&compressed).map_err(SessionError::Message)?;
-        self.latest_remote_state = self.latest_remote_state.max(update.target_state);
         if self
             .pending_update
             .as_ref()
@@ -139,10 +138,16 @@ impl ClientProtocol {
         {
             self.pending_update = None;
         }
+        let advances_remote_state = update.target_state > self.latest_remote_state
+            && update.base_state == self.latest_remote_state;
+        if advances_remote_state {
+            self.latest_remote_state = update.target_state;
+        }
         Ok(Some(ReceivedState {
             packet_counter: authenticated.counter,
             sent_timestamp: header.sent_timestamp,
             echoed_timestamp: header.echoed_timestamp,
+            advances_remote_state,
             update,
         }))
     }
@@ -229,6 +234,7 @@ pub struct ReceivedState {
     pub packet_counter: u64,
     pub sent_timestamp: u16,
     pub echoed_timestamp: u16,
+    pub advances_remote_state: bool,
     pub update: StateUpdate,
 }
 
@@ -331,13 +337,22 @@ mod tests {
             .seal_next(&fragment.encode())
             .expect("server packet must seal");
 
-        assert!(
-            client
-                .ingest(&packet)
-                .expect("acknowledgement must open")
-                .is_some()
-        );
+        let received = client
+            .ingest(&packet)
+            .expect("acknowledgement must open")
+            .expect("acknowledgement must complete");
+        assert!(received.advances_remote_state);
         assert!(!client.has_pending_update());
+
+        let retransmitted_packet = server_channel
+            .seal_next(&fragment.encode())
+            .expect("server retransmission must seal under a fresh counter");
+        let retransmitted = client
+            .ingest(&retransmitted_packet)
+            .expect("server retransmission must authenticate")
+            .expect("server retransmission must complete");
+        assert!(!retransmitted.advances_remote_state);
+        assert_eq!(client.latest_remote_state(), 1);
     }
 
     #[test]

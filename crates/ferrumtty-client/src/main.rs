@@ -2,11 +2,11 @@
 
 use crossterm::event::{self, Event, KeyEventKind};
 use ferrumtty_crypto::SessionKey;
-use ferrumtty_predict::{InputKind, PredictionOverlay};
+use ferrumtty_predict::{InputKind, PredictionDisplay, PredictionOverlay};
 use ferrumtty_runtime::{MonotonicTime, RuntimeError, SessionAction, SessionRuntime};
 use ferrumtty_terminal::{
-    EscapeAction, EscapeInterpreter, TerminalGuard, encode_focus, encode_key, encode_mouse,
-    encode_paste, terminal_size,
+    CursorKeyMode, EscapeAction, EscapeInterpreter, TerminalGuard, encode_focus,
+    encode_key_with_mode, encode_mouse, encode_paste, terminal_size,
 };
 use std::env;
 use std::io::{self, IsTerminal};
@@ -20,6 +20,24 @@ use zeroize::{Zeroize, Zeroizing};
 const RECEIVE_BUFFER_BYTES: usize = 65_535;
 const LOOP_INTERVAL: Duration = Duration::from_millis(20);
 const SUSPEND_DETECTION_MILLISECONDS: u64 = 5_000;
+const DEFAULT_ESCAPE_BYTE: u8 = 0x1e;
+
+#[derive(Debug, Eq, PartialEq)]
+enum Command {
+    Colors,
+    Connect(ClientConfig),
+}
+
+/// Holds CLI and environment settings at the client/runtime boundary.
+#[derive(Debug, Eq, PartialEq)]
+struct ClientConfig {
+    endpoint: String,
+    verbosity: u8,
+    escape_byte: u8,
+    title_no_prefix: bool,
+    prediction_display: PredictionDisplay,
+    prediction_overwrite: bool,
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -32,12 +50,20 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
+    let command = parse_command(env::args(), |name| env::var(name).ok())?;
+    if command == Command::Colors {
+        println!("{}", crossterm::style::available_color_count());
+        return Ok(());
+    }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(text(Text::TerminalRequired).to_owned());
     }
-    let endpoint = parse_endpoint()?;
+    let Command::Connect(config) = command else {
+        unreachable!("color mode returned before terminal setup")
+    };
+    write_debug_configuration(&config);
     let key = read_session_key()?;
-    let socket = connect_socket(&endpoint)?;
+    let socket = connect_socket(&config.endpoint)?;
     let termination_requested = install_termination_flag()?;
     let mut terminal = TerminalGuard::enter()
         .map_err(|error| format!("{}: {error}", text(Text::TerminalSetupFailed)))?;
@@ -52,23 +78,93 @@ fn run() -> Result<(), String> {
         &mut terminal,
         started_at,
         &termination_requested,
+        &config,
     )
 }
 
-fn parse_endpoint() -> Result<String, String> {
-    let mut arguments = env::args();
+fn parse_command<I, F>(arguments: I, environment: F) -> Result<Command, String>
+where
+    I: IntoIterator<Item = String>,
+    F: Fn(&str) -> Option<String>,
+{
+    let mut arguments = arguments.into_iter();
     let program = arguments.next().unwrap_or_else(|| "ferrumtty".to_owned());
-    let host = arguments.next().ok_or_else(|| usage(&program))?;
-    let port = arguments.next().ok_or_else(|| usage(&program))?;
-    let port = port.parse::<u16>().map_err(|_| usage(&program))?;
-    if arguments.next().is_some() || port == 0 {
+    let remaining = arguments.collect::<Vec<_>>();
+    if remaining == ["-c"] {
+        return Ok(Command::Colors);
+    }
+    let mut verbosity = 0_u8;
+    let mut position = 0;
+    while let Some(argument) = remaining.get(position) {
+        if argument.len() < 2 || !argument.as_bytes()[1..].iter().all(|byte| *byte == b'v') {
+            break;
+        }
+        verbosity = verbosity.saturating_add(u8::try_from(argument.len() - 1).unwrap_or(u8::MAX));
+        position += 1;
+    }
+    let host = remaining.get(position).ok_or_else(|| usage(&program))?;
+    position += 1;
+    let port = remaining
+        .get(position)
+        .ok_or_else(|| usage(&program))?
+        .parse::<u16>()
+        .map_err(|_| usage(&program))?;
+    position += 1;
+    if position != remaining.len() || port == 0 {
         return Err(usage(&program));
     }
-    Ok(format!("{host}:{port}"))
+    let escape_byte = environment("MOSH_ESCAPE_KEY")
+        .map_or(Ok(DEFAULT_ESCAPE_BYTE), |value| parse_escape_key(&value))?;
+    Ok(Command::Connect(ClientConfig {
+        endpoint: format!("{host}:{port}"),
+        verbosity,
+        escape_byte,
+        title_no_prefix: environment("MOSH_TITLE_NOPREFIX").is_some(),
+        prediction_display: parse_prediction_display(
+            environment("MOSH_PREDICTION_DISPLAY").as_deref(),
+        )?,
+        prediction_overwrite: environment("MOSH_PREDICTION_OVERWRITE").as_deref() == Some("yes"),
+    }))
+}
+
+fn parse_prediction_display(value: Option<&str>) -> Result<PredictionDisplay, String> {
+    match value.unwrap_or("adaptive") {
+        "adaptive" => Ok(PredictionDisplay::Adaptive),
+        "always" => Ok(PredictionDisplay::Always),
+        "never" => Ok(PredictionDisplay::Never),
+        _ => Err(text(Text::InvalidPredictionDisplay).to_owned()),
+    }
+}
+
+fn parse_escape_key(value: &str) -> Result<u8, String> {
+    let bytes = value.as_bytes();
+    if bytes.len() == 1 && matches!(bytes[0], 1..=127) {
+        return Ok(bytes[0]);
+    }
+    Err(text(Text::InvalidEscapeKey).to_owned())
+}
+
+fn write_debug_configuration(config: &ClientConfig) {
+    if config.verbosity == 0 {
+        return;
+    }
+    eprintln!("FerrumTTY: connecting to {}", config.endpoint);
+    if config.verbosity > 1 {
+        eprintln!(
+            "FerrumTTY: escape={} title_no_prefix={} prediction_display={:?} prediction_overwrite={:?}",
+            config.escape_byte,
+            config.title_no_prefix,
+            config.prediction_display,
+            config.prediction_overwrite
+        );
+    }
 }
 
 fn usage(program: &str) -> String {
-    format!("{}: {program} HOST PORT", text(Text::Usage))
+    format!(
+        "{}: {program} [-v...] HOST PORT\n       {program} -c",
+        text(Text::Usage)
+    )
 }
 
 fn read_session_key() -> Result<SessionKey, String> {
@@ -123,10 +219,12 @@ fn event_loop(
     terminal: &mut TerminalGuard,
     started_at: Instant,
     termination_requested: &AtomicBool,
+    config: &ClientConfig,
 ) -> Result<(), String> {
     let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_BYTES];
-    let mut predictor = PredictionOverlay::default();
-    let mut escape = EscapeInterpreter::default();
+    let mut predictor =
+        PredictionOverlay::new(config.prediction_display, config.prediction_overwrite);
+    let mut escape = EscapeInterpreter::new(config.escape_byte);
     let mut previous_poll = monotonic_time(started_at);
     let result = loop {
         if termination_requested.load(Ordering::Relaxed) {
@@ -153,6 +251,7 @@ fn event_loop(
             Ok(false) => {}
             Err(error) => break Err(error),
         }
+        predictor.set_round_trip_milliseconds(runtime.round_trip_milliseconds());
         match drain_terminal(runtime, terminal, &mut predictor, &mut escape) {
             Ok(true) => break Ok(()),
             Ok(false) => {}
@@ -231,7 +330,7 @@ fn drain_terminal(
     {
         match event::read().map_err(|error| format!("{}: {error}", text(Text::InputFailed)))? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if let Some(bytes) = encode_key(key) {
+                if let Some(bytes) = encode_key_with_mode(key, CursorKeyMode::Application) {
                     match escape.input(bytes) {
                         EscapeAction::Hold => {}
                         EscapeAction::Quit => return Ok(true),
@@ -315,6 +414,7 @@ fn apply_actions(
                     .write_server_bytes(&bytes)
                     .map_err(|error| format!("{}: {error}", text(Text::TerminalWriteFailed)))?;
             }
+            SessionAction::AcknowledgePrediction(value) => predictor.acknowledge(value),
         }
     }
     Ok(())
@@ -340,7 +440,6 @@ fn monotonic_time(started_at: Instant) -> MonotonicTime {
 fn format_runtime_error(error: RuntimeError) -> String {
     match error {
         RuntimeError::InputQueueFull => text(Text::InputQueueFull).to_owned(),
-        RuntimeError::ServerTimeout => text(Text::ServerTimeout).to_owned(),
         other => format!("{}: {other:?}", text(Text::ProtocolFailed)),
     }
 }
@@ -352,13 +451,14 @@ enum Text {
     InputFailed,
     InputQueueFull,
     InvalidKey,
+    InvalidEscapeKey,
+    InvalidPredictionDisplay,
     MissingKey,
     NoAddress,
     ProtocolFailed,
     ReceiveFailed,
     ResolveFailed,
     SendFailed,
-    ServerTimeout,
     SignalSetupFailed,
     SocketFailed,
     TerminalRequired,
@@ -383,13 +483,18 @@ fn text_en(message: Text) -> &'static str {
         Text::InputFailed => "could not read terminal input",
         Text::InputQueueFull => "local input queue limit reached",
         Text::InvalidKey => "MOSH_KEY is invalid",
+        Text::InvalidEscapeKey => {
+            "MOSH_ESCAPE_KEY must be one literal ASCII character in the range 1-127"
+        }
+        Text::InvalidPredictionDisplay => {
+            "MOSH_PREDICTION_DISPLAY must be adaptive, always, or never"
+        }
         Text::MissingKey => "MOSH_KEY is not set",
         Text::NoAddress => "no address was resolved",
         Text::ProtocolFailed => "protocol operation failed",
         Text::ReceiveFailed => "UDP receive failed",
         Text::ResolveFailed => "host lookup failed",
         Text::SendFailed => "UDP send failed",
-        Text::ServerTimeout => "server did not respond before the timeout",
         Text::SignalSetupFailed => "could not install termination handling",
         Text::SocketFailed => "could not configure UDP socket",
         Text::TerminalRequired => "standard input and output must be terminals",
@@ -407,13 +512,16 @@ fn text_zh(message: Text) -> &'static str {
         Text::InputFailed => "无法读取终端输入",
         Text::InputQueueFull => "本地输入队列已达到上限",
         Text::InvalidKey => "MOSH_KEY 无效",
+        Text::InvalidEscapeKey => "MOSH_ESCAPE_KEY 必须是一个取值为 1-127 的字面 ASCII 字符",
+        Text::InvalidPredictionDisplay => {
+            "MOSH_PREDICTION_DISPLAY 必须是 adaptive、always 或 never"
+        }
         Text::MissingKey => "未设置 MOSH_KEY",
         Text::NoAddress => "未解析到可用地址",
         Text::ProtocolFailed => "协议操作失败",
         Text::ReceiveFailed => "UDP 接收失败",
         Text::ResolveFailed => "主机名解析失败",
         Text::SendFailed => "UDP 发送失败",
-        Text::ServerTimeout => "服务器未在超时前响应",
         Text::SignalSetupFailed => "无法安装终止信号处理",
         Text::SocketFailed => "无法配置 UDP 套接字",
         Text::TerminalRequired => "标准输入和输出必须连接终端",
@@ -421,5 +529,70 @@ fn text_zh(message: Text) -> &'static str {
         Text::TerminalSizeFailed => "无法读取终端尺寸",
         Text::TerminalWriteFailed => "无法写入终端输出",
         Text::Usage => "用法",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientConfig, Command, DEFAULT_ESCAPE_BYTE, parse_command, parse_escape_key};
+    use ferrumtty_predict::PredictionDisplay;
+    use std::collections::HashMap;
+
+    fn parse(arguments: &[&str], environment: &[(&str, &str)]) -> Result<Command, String> {
+        let arguments = arguments.iter().map(|value| (*value).to_owned());
+        let environment = environment
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect::<HashMap<_, _>>();
+        parse_command(arguments, |name| environment.get(name).cloned())
+    }
+
+    #[test]
+    fn parses_color_mode_without_connection_arguments() {
+        assert_eq!(parse(&["mosh-client", "-c"], &[]), Ok(Command::Colors));
+        assert!(parse(&["mosh-client", "-c", "host", "60001"], &[]).is_err());
+    }
+
+    #[test]
+    fn parses_repeated_verbose_flags_and_environment_boundary() {
+        assert_eq!(
+            parse(
+                &["mosh-client", "-vv", "-v", "example.test", "60001"],
+                &[
+                    ("MOSH_ESCAPE_KEY", "\u{2}"),
+                    ("MOSH_TITLE_NOPREFIX", "1"),
+                    ("MOSH_PREDICTION_DISPLAY", "always"),
+                    ("MOSH_PREDICTION_OVERWRITE", "yes"),
+                ],
+            ),
+            Ok(Command::Connect(ClientConfig {
+                endpoint: "example.test:60001".to_owned(),
+                verbosity: 3,
+                escape_byte: 2,
+                title_no_prefix: true,
+                prediction_display: PredictionDisplay::Always,
+                prediction_overwrite: true,
+            }))
+        );
+        assert!(
+            parse(
+                &["mosh-client", "example.test", "60001"],
+                &[("MOSH_PREDICTION_DISPLAY", "experimental")],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn uses_default_escape_and_rejects_invalid_escape_values() {
+        let Ok(Command::Connect(config)) = parse(&["mosh-client", "127.0.0.1", "60001"], &[])
+        else {
+            panic!("connection arguments should parse")
+        };
+        assert_eq!(config.escape_byte, DEFAULT_ESCAPE_BYTE);
+        assert!(parse_escape_key("").is_err());
+        assert!(parse_escape_key("ab").is_err());
+        assert!(parse_escape_key("\u{80}").is_err());
+        assert!(parse_escape_key("\0").is_err());
     }
 }

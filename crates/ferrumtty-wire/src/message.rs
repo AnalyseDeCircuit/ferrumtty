@@ -46,8 +46,8 @@ impl StateUpdate {
     ///
     /// # Errors
     ///
-    /// Returns an error for unknown fields, unsupported wire types, malformed
-    /// Protobuf, or a protocol value other than 2.
+    /// Returns an error for malformed known fields, unsupported wire types,
+    /// malformed Protobuf, or a protocol value other than 2.
     pub fn decode_instructions(&self) -> Result<InstructionBatch, MessageError> {
         validate_instruction_batch(&self.delta)?;
         InstructionBatch::decode(self.delta.as_slice()).map_err(|_| MessageError::MalformedProtobuf)
@@ -119,11 +119,11 @@ pub fn encode_compressed_update(update: &StateUpdate) -> Result<Vec<u8>, Message
         .map_err(|_| MessageError::CompressionFailed)
 }
 
-/// Decompresses a bounded zlib stream and rejects undocumented Protobuf fields.
+/// Decompresses a bounded zlib stream and skips unknown Protobuf fields.
 ///
 /// # Errors
 ///
-/// Returns an error for invalid zlib, oversized output, unknown fields,
+/// Returns an error for invalid zlib, oversized output, malformed known fields,
 /// malformed Protobuf, or an unsupported protocol value.
 pub fn decode_compressed_update(compressed: &[u8]) -> Result<StateUpdate, MessageError> {
     let mut decoder = ZlibDecoder::new(compressed);
@@ -157,7 +157,7 @@ fn validate_instruction_batch(encoded: &[u8]) -> Result<(), MessageError> {
                 2 => validate_fields(value, &[(4, 2)])?,
                 3 => validate_fields(value, &[(5, 0), (6, 0)])?,
                 7 => validate_fields(value, &[(8, 0)])?,
-                _ => return Err(MessageError::UnknownField),
+                _ => {}
             }
         }
     }
@@ -171,8 +171,10 @@ fn validate_fields(encoded: &[u8], allowed: &[(u64, u8)]) -> Result<(), MessageE
         remaining = &remaining[key_bytes..];
         let field = key >> 3;
         let wire_type = u8::try_from(key & 7).expect("wire type fits u8");
-        if !allowed.contains(&(field, wire_type)) {
-            return Err(MessageError::UnknownField);
+        if let Some((_, expected_wire_type)) = allowed.iter().find(|(known, _)| *known == field) {
+            if wire_type != *expected_wire_type {
+                return Err(MessageError::UnsupportedWireType);
+            }
         }
         remaining = skip_value(remaining, wire_type)?;
     }
@@ -186,6 +188,7 @@ fn length_delimited_values<'a>(
     validate_fields(encoded, allowed)?;
     Ok(length_delimited_fields(encoded)?
         .into_iter()
+        .filter(|(field, _)| allowed.contains(&(*field, 2)))
         .map(|(_, value)| value)
         .collect())
 }
@@ -222,6 +225,7 @@ fn skip_value(encoded: &[u8], wire_type: u8) -> Result<&[u8], MessageError> {
             let (_, bytes) = decode_varint(encoded)?;
             Ok(&encoded[bytes..])
         }
+        1 => encoded.get(8..).ok_or(MessageError::MalformedProtobuf),
         2 => {
             let (length, bytes) = decode_varint(encoded)?;
             let length = usize::try_from(length).map_err(|_| MessageError::MalformedProtobuf)?;
@@ -229,6 +233,7 @@ fn skip_value(encoded: &[u8], wire_type: u8) -> Result<&[u8], MessageError> {
                 .get(length..)
                 .ok_or(MessageError::MalformedProtobuf)
         }
+        5 => encoded.get(4..).ok_or(MessageError::MalformedProtobuf),
         _ => Err(MessageError::UnsupportedWireType),
     }
 }
@@ -255,7 +260,6 @@ pub enum MessageError {
     DecompressedMessageTooLarge,
     MalformedProtobuf,
     UnsupportedProtocolVersion,
-    UnknownField,
     UnsupportedWireType,
 }
 
@@ -316,10 +320,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_top_level_field() {
+    fn skips_unknown_top_level_field() {
+        assert_eq!(validate_fields(&[0x40, 0x01], &[(1, 0)]), Ok(()));
+    }
+
+    #[test]
+    fn rejects_wrong_wire_type_for_known_field() {
         assert_eq!(
-            validate_fields(&[0x40, 0x01], &[(1, 0)]),
-            Err(MessageError::UnknownField)
+            validate_fields(&[0x0a, 0x00], &[(1, 0)]),
+            Err(MessageError::UnsupportedWireType)
         );
     }
 

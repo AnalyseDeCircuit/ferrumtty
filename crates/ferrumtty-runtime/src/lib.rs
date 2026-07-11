@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 const INITIAL_RETRANSMIT_MILLISECONDS: u64 = 250;
 const MAXIMUM_RETRANSMIT_MILLISECONDS: u64 = 2_000;
 const HEARTBEAT_MILLISECONDS: u64 = 3_000;
-const SERVER_TIMEOUT_MILLISECONDS: u64 = 30_000;
+const SERVER_UNRESPONSIVE_MILLISECONDS: u64 = 30_000;
 const MAXIMUM_QUEUED_INPUT_BYTES: usize = 1024 * 1024;
 
 /// A monotonic millisecond value supplied by the embedding host.
@@ -38,6 +38,7 @@ impl MonotonicTime {
 pub enum SessionAction {
     SendDatagram(Vec<u8>),
     WriteTerminal(Vec<u8>),
+    AcknowledgePrediction(u64),
 }
 
 /// Owns synchronization, timers, and bounded local input pending transport.
@@ -51,6 +52,7 @@ pub struct SessionRuntime {
     retransmit_milliseconds: u64,
     acknowledgement_due: bool,
     received_server_state: bool,
+    round_trip_milliseconds: Option<u16>,
 }
 
 impl SessionRuntime {
@@ -66,6 +68,7 @@ impl SessionRuntime {
             retransmit_milliseconds: INITIAL_RETRANSMIT_MILLISECONDS,
             acknowledgement_due: false,
             received_server_state: false,
+            round_trip_milliseconds: None,
         }
     }
 
@@ -125,8 +128,17 @@ impl SessionRuntime {
             return Ok(Vec::new());
         };
         self.last_receive = now;
+        if state.echoed_timestamp != u16::MAX {
+            let elapsed = timestamp(now).wrapping_sub(state.echoed_timestamp);
+            if i16::try_from(elapsed).is_ok() {
+                self.round_trip_milliseconds = Some(elapsed);
+            }
+        }
         self.acknowledgement_due = true;
         self.received_server_state = true;
+        if !state.advances_remote_state {
+            return Ok(Vec::new());
+        }
         let instructions = state
             .update
             .decode_instructions()
@@ -134,8 +146,16 @@ impl SessionRuntime {
         Ok(instructions
             .instructions
             .into_iter()
-            .filter_map(|instruction| instruction.bytes)
-            .map(|bytes| SessionAction::WriteTerminal(bytes.value))
+            .flat_map(|instruction| {
+                let mut actions = Vec::with_capacity(2);
+                if let Some(bytes) = instruction.bytes {
+                    actions.push(SessionAction::WriteTerminal(bytes.value));
+                }
+                if let Some(marker) = instruction.marker {
+                    actions.push(SessionAction::AcknowledgePrediction(marker.value));
+                }
+                actions
+            })
             .collect())
     }
 
@@ -143,11 +163,8 @@ impl SessionRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error for a server timeout or protocol encoding failure.
+    /// Returns an error for protocol encoding failure.
     pub fn poll(&mut self, now: MonotonicTime) -> Result<Vec<SessionAction>, RuntimeError> {
-        if now.elapsed_since(self.last_receive) >= SERVER_TIMEOUT_MILLISECONDS {
-            return Err(RuntimeError::ServerTimeout);
-        }
         if self.protocol.has_pending_update() {
             let last_send = self.last_send.unwrap_or(now);
             if now.elapsed_since(last_send) < self.retransmit_milliseconds {
@@ -199,9 +216,7 @@ impl SessionRuntime {
 
     #[must_use]
     pub fn milliseconds_until_next_poll(&self, now: MonotonicTime) -> u64 {
-        let server_remaining =
-            SERVER_TIMEOUT_MILLISECONDS.saturating_sub(now.elapsed_since(self.last_receive));
-        let send_remaining = if self.protocol.has_pending_update() {
+        if self.protocol.has_pending_update() {
             self.last_send.map_or(0, |last_send| {
                 self.retransmit_milliseconds
                     .saturating_sub(now.elapsed_since(last_send))
@@ -215,13 +230,24 @@ impl SessionRuntime {
             self.last_send.map_or(0, |last_send| {
                 HEARTBEAT_MILLISECONDS.saturating_sub(now.elapsed_since(last_send))
             })
-        };
-        send_remaining.min(server_remaining)
+        }
     }
 
     #[must_use]
     pub const fn has_received_server_state(&self) -> bool {
         self.received_server_state
+    }
+
+    /// Reports whether the server has responded recently without ending an
+    /// otherwise recoverable Mosh session when connectivity is intermittent.
+    #[must_use]
+    pub fn is_server_responsive(&self, now: MonotonicTime) -> bool {
+        now.elapsed_since(self.last_receive) < SERVER_UNRESPONSIVE_MILLISECONDS
+    }
+
+    #[must_use]
+    pub const fn round_trip_milliseconds(&self) -> Option<u16> {
+        self.round_trip_milliseconds
     }
 }
 
@@ -240,7 +266,6 @@ fn send_actions(packets: Vec<Vec<u8>>) -> Vec<SessionAction> {
 #[derive(Debug)]
 pub enum RuntimeError {
     InputQueueFull,
-    ServerTimeout,
     Session(SessionError),
     Message(MessageError),
 }
@@ -285,16 +310,14 @@ mod tests {
     }
 
     #[test]
-    fn input_and_timeout_are_bounded() {
+    fn input_is_bounded_and_network_silence_is_recoverable() {
         let mut runtime = SessionRuntime::new(key(), time(10));
         assert!(matches!(
             runtime.queue_input(vec![0; 1024 * 1024 + 1]),
             Err(RuntimeError::InputQueueFull)
         ));
-        assert!(matches!(
-            runtime.poll(time(30_010)),
-            Err(RuntimeError::ServerTimeout)
-        ));
+        assert!(!runtime.is_server_responsive(time(30_010)));
+        assert!(runtime.poll(time(30_010)).is_ok());
     }
 
     #[test]
@@ -349,15 +372,41 @@ mod tests {
         assert_eq!(runtime.milliseconds_until_next_poll(time(120_000)), 250);
     }
 
+    #[test]
+    fn server_echo_ack_is_exposed_to_the_prediction_host() {
+        let mut runtime = SessionRuntime::new(key(), time(0));
+        let packet = server_instruction_packet(
+            0,
+            Instruction {
+                bytes: None,
+                viewport: None,
+                marker: Some(ferrumtty_wire::Marker { value: 17 }),
+            },
+        );
+        assert_eq!(
+            runtime
+                .receive_datagram(&packet, time(1))
+                .expect("echo acknowledgement must decode"),
+            vec![SessionAction::AcknowledgePrediction(17)]
+        );
+    }
+
     fn server_packet(acknowledged_state: u64, output: &[u8]) -> Vec<u8> {
-        let batch = InstructionBatch {
-            instructions: vec![Instruction {
+        server_instruction_packet(
+            acknowledged_state,
+            Instruction {
                 bytes: Some(ByteRun {
                     value: output.to_vec(),
                 }),
                 viewport: None,
                 marker: None,
-            }],
+            },
+        )
+    }
+
+    fn server_instruction_packet(acknowledged_state: u64, instruction: Instruction) -> Vec<u8> {
+        let batch = InstructionBatch {
+            instructions: vec![instruction],
         };
         let mut update = StateUpdate::new(0, 1, acknowledged_state);
         update.delta = batch.encode_bytes();

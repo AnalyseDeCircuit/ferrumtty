@@ -97,16 +97,30 @@ placing it in command-line arguments.
 | `Ctrl-^ .` | End the local session |
 | `Ctrl-^ ^` | Send a literal `Ctrl-^` |
 
+Set `MOSH_ESCAPE_KEY` to one literal ASCII character to choose another local
+command prefix. Printable prefixes follow the conventional newline-prefix
+behavior; control-character prefixes are recognized directly.
+
 FerrumTTY uses the local alternate screen by default so the original terminal
 contents return after exit. Set `MOSH_NO_TERM_INIT=1` to keep the current screen.
 If the operating system cannot report the viewport, positive `COLUMNS` and
 `LINES` environment variables are used as a fallback.
 
+| Environment | Effect |
+| --- | --- |
+| `MOSH_KEY` | Required 128-bit session key from `MOSH CONNECT` |
+| `MOSH_ESCAPE_KEY` | One literal ASCII local-command prefix |
+| `MOSH_PREDICTION_DISPLAY` | `adaptive`, `always`, or `never` |
+| `MOSH_PREDICTION_OVERWRITE=yes` | Overwrite instead of insert predicted cells |
+| `MOSH_TITLE_NOPREFIX` | Accepted for standard-client compatibility; FerrumTTY adds no title prefix |
+| `MOSH_NO_TERM_INIT=1` | Skip local alternate-screen initialization |
+
 ## What works
 
 - AES-128 OCB3 authenticated datagrams
 - Bounded packet replay window and fragment reassembly
-- Acknowledgements, retransmission backoff, heartbeat, and timeout
+- Acknowledgements, retransmission backoff, heartbeat, and liveness tracking
+- Stale-state suppression and recoverable indefinite network interruption
 - IPv4 and IPv6 endpoints
 - Client UDP rebinding and suspend/resume recovery
 - UTF-8 terminal output and authoritative VT screen tracking
@@ -116,6 +130,7 @@ If the operating system cannot report the viewport, positive `COLUMNS` and
 - English and Simplified Chinese command-line diagnostics
 - Native source checks for macOS, Linux, and Windows targets
 - Static MSVC runtime in Windows release binaries
+- `mosh-client -c`, `-v`, and standard Mosh client environment parsing
 
 On Windows, console control events for Ctrl+C and Ctrl+Break are ignored by the
 local process so their input can be forwarded to the remote session. This path

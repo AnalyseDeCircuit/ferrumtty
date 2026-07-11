@@ -23,6 +23,16 @@ The host must:
    server timeout;
 7. discard the runtime and restore local terminal state on every exit path.
 
+`SessionAction::AcknowledgePrediction` carries the newest server `EchoAck` to
+the host prediction layer. It is not terminal output and must not be written to
+the screen. `SessionRuntime::is_server_responsive` reports prolonged network
+silence without terminating the session; the host may display connection state
+while continuing to poll and send heartbeats so Mosh can recover later.
+
+Remote state updates are applied only when their base matches the latest
+applied server state. Retransmitted or stale states may still acknowledge local
+state, but their terminal instructions are not applied twice.
+
 The host must not persist the session key, terminal content, plaintext packet
 payloads, or generated datagrams. A host may change its local UDP address while
 retaining the same authenticated remote endpoint. Changing the remote endpoint

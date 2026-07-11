@@ -14,12 +14,26 @@ Verified behavior includes:
 
 - AES-128 OCB3 authentication in both packet directions;
 - encrypted UDP framing, bounded fragmentation, and Protobuf state updates;
-- acknowledgements, fresh-counter retransmission, heartbeat, and timeout;
+- acknowledgements, fresh-counter retransmission, heartbeat, and recoverable
+  liveness tracking;
 - packet loss, duplicate rejection, bounded reordering, and client UDP
   rebinding;
 - UTF-8 terminal output, resize, keyboard, mouse, focus, and bracketed paste;
 - conservative local prediction with authoritative-screen rollback;
 - terminal restoration after local escape and termination signals.
+
+Synthetic compatibility checks additionally cover:
+
+- suppression of a completed server state retransmitted under a fresh packet
+  counter;
+- refusal to apply a state delta whose base is not the latest applied state;
+- forward-compatible skipping of unknown Protobuf fields while retaining wire
+  type validation for known fields;
+- delivery of server `EchoAck` markers to the prediction boundary;
+- continued polling and heartbeat scheduling after prolonged network silence.
+
+These checks use constructed protocol states and do not constitute a native
+terminal or live-server interoperability test.
 
 The source tree is checked for macOS arm64/x86_64, Linux arm64/x86_64, and
 Windows x86_64 targets. A platform build check is not a substitute for a native

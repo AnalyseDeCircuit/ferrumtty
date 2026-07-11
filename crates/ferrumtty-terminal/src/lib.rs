@@ -12,6 +12,20 @@ const DEFAULT_ESCAPE_BYTE: u8 = 0x1e;
 const COLUMNS_ENVIRONMENT_VARIABLE: &str = "COLUMNS";
 const LINES_ENVIRONMENT_VARIABLE: &str = "LINES";
 const SKIP_TERMINAL_INITIALIZATION_VARIABLE: &str = "MOSH_NO_TERM_INIT";
+const CSI_MODIFIER_BASE: u8 = 1;
+const SHIFT_MODIFIER_VALUE: u8 = 1;
+const ALT_MODIFIER_VALUE: u8 = 2;
+const CONTROL_MODIFIER_VALUE: u8 = 4;
+
+/// Selects how unmodified cursor keys are encoded for the remote application.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CursorKeyMode {
+    /// Uses ANSI CSI cursor sequences such as `ESC [ A`.
+    #[default]
+    Normal,
+    /// Uses application cursor sequences such as `ESC O A`.
+    Application,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum EscapeAction {
@@ -20,42 +34,74 @@ pub enum EscapeAction {
     Quit,
 }
 
-/// Interprets the documented local two-key escape without forwarding the
-/// prefix until its meaning is known.
-#[derive(Default)]
+/// Interprets the configured Mosh local-command prefix.
 pub struct EscapeInterpreter {
+    escape_byte: u8,
     prefix_held: bool,
+    at_line_start: bool,
+}
+
+impl Default for EscapeInterpreter {
+    fn default() -> Self {
+        Self::new(DEFAULT_ESCAPE_BYTE)
+    }
 }
 
 impl EscapeInterpreter {
     #[must_use]
+    pub const fn new(escape_byte: u8) -> Self {
+        Self {
+            escape_byte,
+            prefix_held: false,
+            at_line_start: true,
+        }
+    }
+
+    #[must_use]
     pub fn input(&mut self, bytes: Vec<u8>) -> EscapeAction {
         if !self.prefix_held {
-            if bytes == [DEFAULT_ESCAPE_BYTE] {
+            let printable_escape = self.escape_byte.is_ascii_graphic() || self.escape_byte == b' ';
+            if bytes == [self.escape_byte] && (!printable_escape || self.at_line_start) {
                 self.prefix_held = true;
                 return EscapeAction::Hold;
             }
-            return EscapeAction::Forward(bytes);
+            return self.forward(bytes);
         }
         self.prefix_held = false;
         if bytes == b"." {
             return EscapeAction::Quit;
         }
-        if bytes == b"^" {
-            return EscapeAction::Forward(vec![DEFAULT_ESCAPE_BYTE]);
+        if bytes == [self.literal_escape_suffix()] {
+            return self.forward(vec![self.escape_byte]);
         }
         let mut forwarded = Vec::with_capacity(bytes.len() + 1);
-        forwarded.push(DEFAULT_ESCAPE_BYTE);
+        forwarded.push(self.escape_byte);
         forwarded.extend(bytes);
-        EscapeAction::Forward(forwarded)
+        self.forward(forwarded)
     }
 
     #[must_use]
     pub fn flush(&mut self) -> Option<Vec<u8>> {
         self.prefix_held.then(|| {
             self.prefix_held = false;
-            vec![DEFAULT_ESCAPE_BYTE]
+            self.at_line_start = false;
+            vec![self.escape_byte]
         })
+    }
+
+    fn literal_escape_suffix(&self) -> u8 {
+        match self.escape_byte {
+            1..=31 => self.escape_byte + 64,
+            127 => b'?',
+            printable => printable,
+        }
+    }
+
+    fn forward(&mut self, bytes: Vec<u8>) -> EscapeAction {
+        self.at_line_start = bytes
+            .last()
+            .is_some_and(|byte| matches!(byte, b'\r' | b'\n'));
+        EscapeAction::Forward(bytes)
     }
 }
 
@@ -214,6 +260,12 @@ impl Drop for TerminalGuard {
 /// xterm-compatible terminal.
 #[must_use]
 pub fn encode_key(event: KeyEvent) -> Option<Vec<u8>> {
+    encode_key_with_mode(event, CursorKeyMode::Normal)
+}
+
+/// Converts a local key event using the selected remote cursor-key mode.
+#[must_use]
+pub fn encode_key_with_mode(event: KeyEvent, cursor_key_mode: CursorKeyMode) -> Option<Vec<u8>> {
     let modifiers = event.modifiers;
     let bytes = match event.code {
         KeyCode::Char(character) if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -233,20 +285,36 @@ pub fn encode_key(event: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Tab => b"\t".to_vec(),
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Up => encode_cursor_key(b'A', modifiers, cursor_key_mode),
+        KeyCode::Down => encode_cursor_key(b'B', modifiers, cursor_key_mode),
+        KeyCode::Right => encode_cursor_key(b'C', modifiers, cursor_key_mode),
+        KeyCode::Left => encode_cursor_key(b'D', modifiers, cursor_key_mode),
         KeyCode::Home => b"\x1b[H".to_vec(),
         KeyCode::End => b"\x1b[F".to_vec(),
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
         KeyCode::Insert => b"\x1b[2~".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::F(number) => encode_function_key(number)?.to_vec(),
+        KeyCode::F(number) => encode_function_key(number, modifiers)?,
         _ => return None,
     };
     Some(bytes)
+}
+
+fn encode_cursor_key(
+    final_byte: u8,
+    modifiers: KeyModifiers,
+    cursor_key_mode: CursorKeyMode,
+) -> Vec<u8> {
+    if let Some(modifier_parameter) = key_modifier_parameter(modifiers) {
+        return format!("\x1b[1;{modifier_parameter}{}", char::from(final_byte)).into_bytes();
+    }
+
+    let introducer = match cursor_key_mode {
+        CursorKeyMode::Normal => b'[',
+        CursorKeyMode::Application => b'O',
+    };
+    vec![0x1b, introducer, final_byte]
 }
 
 #[must_use]
@@ -336,22 +404,39 @@ fn encode_control(character: char) -> Option<u8> {
     }
 }
 
-fn encode_function_key(number: u8) -> Option<&'static [u8]> {
-    match number {
-        1 => Some(b"\x1bOP"),
-        2 => Some(b"\x1bOQ"),
-        3 => Some(b"\x1bOR"),
-        4 => Some(b"\x1bOS"),
-        5 => Some(b"\x1b[15~"),
-        6 => Some(b"\x1b[17~"),
-        7 => Some(b"\x1b[18~"),
-        8 => Some(b"\x1b[19~"),
-        9 => Some(b"\x1b[20~"),
-        10 => Some(b"\x1b[21~"),
-        11 => Some(b"\x1b[23~"),
-        12 => Some(b"\x1b[24~"),
+fn encode_function_key(number: u8, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+    let modifier_parameter = key_modifier_parameter(modifiers);
+    match (number, modifier_parameter) {
+        (1..=4, None) => Some(vec![0x1b, b'O', b'P' + number - 1]),
+        (1..=4, Some(parameter)) => {
+            Some(format!("\x1b[1;{parameter}{}", char::from(b'P' + number - 1)).into_bytes())
+        }
+        (5..=12, parameter) => {
+            let key_parameter = match number {
+                5 => 15,
+                6 => 17,
+                7 => 18,
+                8 => 19,
+                9 => 20,
+                10 => 21,
+                11 => 23,
+                12 => 24,
+                _ => unreachable!(),
+            };
+            Some(match parameter {
+                Some(parameter) => format!("\x1b[{key_parameter};{parameter}~").into_bytes(),
+                None => format!("\x1b[{key_parameter}~").into_bytes(),
+            })
+        }
         _ => None,
     }
+}
+
+fn key_modifier_parameter(modifiers: KeyModifiers) -> Option<u8> {
+    let modifier_value = u8::from(modifiers.contains(KeyModifiers::SHIFT)) * SHIFT_MODIFIER_VALUE
+        + u8::from(modifiers.contains(KeyModifiers::ALT)) * ALT_MODIFIER_VALUE
+        + u8::from(modifiers.contains(KeyModifiers::CONTROL)) * CONTROL_MODIFIER_VALUE;
+    (modifier_value != 0).then_some(CSI_MODIFIER_BASE + modifier_value)
 }
 
 fn mouse_button_code(button: MouseButton) -> u16 {
@@ -365,8 +450,8 @@ fn mouse_button_code(button: MouseButton) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthoritativeScreen, EscapeAction, EscapeInterpreter, encode_focus, encode_key,
-        encode_mouse, encode_paste, viewport_instruction,
+        AuthoritativeScreen, CursorKeyMode, EscapeAction, EscapeInterpreter, encode_focus,
+        encode_key, encode_key_with_mode, encode_mouse, encode_paste, viewport_instruction,
     };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -389,6 +474,63 @@ mod tests {
         assert_eq!(
             encode_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::CONTROL)),
             Some(vec![0x1e])
+        );
+    }
+
+    #[test]
+    fn cursor_mode_changes_unmodified_direction_keys() {
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            encode_key_with_mode(up, CursorKeyMode::Normal),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            encode_key_with_mode(up, CursorKeyMode::Application),
+            Some(b"\x1bOA".to_vec())
+        );
+    }
+
+    #[test]
+    fn direction_keys_encode_common_modifier_combinations() {
+        let modifiers = [
+            (KeyModifiers::SHIFT, b"\x1b[1;2D".as_slice()),
+            (KeyModifiers::ALT, b"\x1b[1;3D".as_slice()),
+            (KeyModifiers::CONTROL, b"\x1b[1;5D".as_slice()),
+            (
+                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+                b"\x1b[1;8D".as_slice(),
+            ),
+        ];
+
+        for (modifier, expected) in modifiers {
+            let left = KeyEvent::new(KeyCode::Left, modifier);
+            assert_eq!(
+                encode_key_with_mode(left, CursorKeyMode::Application),
+                Some(expected.to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn function_keys_encode_common_modifiers() {
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::SHIFT)),
+            Some(b"\x1b[1;2P".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::ALT)),
+            Some(b"\x1b[15;3~".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::CONTROL)),
+            Some(b"\x1b[24;5~".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(
+                KeyCode::F(4),
+                KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            )),
+            Some(b"\x1b[1;6S".to_vec())
         );
     }
 
@@ -465,6 +607,42 @@ mod tests {
         assert_eq!(
             interpreter.input(b"x".to_vec()),
             EscapeAction::Forward(vec![0x1e, b'x'])
+        );
+    }
+
+    #[test]
+    fn configurable_control_escape_uses_its_ascii_suffix() {
+        let mut interpreter = EscapeInterpreter::new(2);
+        assert_eq!(
+            interpreter.input(b"x".to_vec()),
+            EscapeAction::Forward(b"x".to_vec())
+        );
+        assert_eq!(interpreter.input(vec![2]), EscapeAction::Hold);
+        assert_eq!(
+            interpreter.input(b"B".to_vec()),
+            EscapeAction::Forward(vec![2])
+        );
+    }
+
+    #[test]
+    fn printable_escape_requires_line_start_and_repeats_literally() {
+        let mut interpreter = EscapeInterpreter::new(b'~');
+        assert_eq!(
+            interpreter.input(b"x".to_vec()),
+            EscapeAction::Forward(b"x".to_vec())
+        );
+        assert_eq!(
+            interpreter.input(b"~".to_vec()),
+            EscapeAction::Forward(b"~".to_vec())
+        );
+        assert_eq!(
+            interpreter.input(b"\r".to_vec()),
+            EscapeAction::Forward(b"\r".to_vec())
+        );
+        assert_eq!(interpreter.input(b"~".to_vec()), EscapeAction::Hold);
+        assert_eq!(
+            interpreter.input(b"~".to_vec()),
+            EscapeAction::Forward(b"~".to_vec())
         );
     }
 }
