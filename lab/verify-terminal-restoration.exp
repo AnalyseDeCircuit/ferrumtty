@@ -1,0 +1,36 @@
+#!/usr/bin/expect -f
+
+# Verify terminal mode restoration through a real pseudo-terminal.
+set timeout 10
+set client_binary [expr {[info exists env(FERRUMTTY_CLIENT_BINARY)] ? $env(FERRUMTTY_CLIENT_BINARY) : "target/debug/ferrumtty"}]
+set synthetic_key "AAECAwQFBgcICQoLDA0ODw"
+if {![file executable $client_binary]} {
+    puts stderr "FerrumTTY client binary is missing: $client_binary"
+    exit 1
+}
+set listener_pid [exec /bin/sh -c {python3 -c 'import socket,time;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",60001));time.sleep(10)' >/dev/null 2>&1 & echo $!}]
+after 100
+
+spawn -noecho /bin/sh -c "before=\$(stty -g); MOSH_KEY='$synthetic_key' '$client_binary' 127.0.0.1 60001; client_status=\$?; after=\$(stty -g); test \"\$client_status\" -eq 0 && test \"\$before\" = \"\$after\" && printf 'FERRUMTTY-ESCAPE-RESTORED\\n'"
+after 300
+send -- "\036."
+expect {
+    "FERRUMTTY-ESCAPE-RESTORED" {}
+    timeout { exit 1 }
+    eof { exit 1 }
+}
+expect eof
+
+catch {exec kill -TERM $listener_pid}
+set listener_pid [exec /bin/sh -c {python3 -c 'import socket,time;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",60002));time.sleep(10)' >/dev/null 2>&1 & echo $!}]
+after 100
+spawn -noecho /bin/sh -c "before=\$(stty -g); (sleep 1; pkill -TERM -P \$\$) & MOSH_KEY='$synthetic_key' '$client_binary' 127.0.0.1 60002; client_status=\$?; after=\$(stty -g); test \"\$client_status\" -eq 0 && test \"\$before\" = \"\$after\" && printf 'FERRUMTTY-SIGNAL-RESTORED\\n'"
+expect {
+    "FERRUMTTY-SIGNAL-RESTORED" {}
+    timeout { exit 1 }
+    eof { exit 1 }
+}
+expect eof
+
+catch {exec kill -TERM $listener_pid}
+puts "terminal state restored after local escape and termination signal"

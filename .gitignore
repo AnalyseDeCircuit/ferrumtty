@@ -1,0 +1,82 @@
+# Rust and release build output
+/target/
+/dist/
+**/*.rs.bk
+*.profraw
+*.profdata
+/coverage/
+/tarpaulin-report.html
+
+# Local fuzzing and crash artifacts
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/*/
+crash-*
+leak-*
+oom-*
+slow-unit-*
+
+# Compatibility-lab output must stay local and synthetic captures must be
+# reviewed before they are deliberately added as sanitized fixtures.
+/lab/artifacts/
+/lab/captures/
+/research/artifacts/
+*.pcap
+*.pcapng
+*.cap
+*.core
+core
+core.*
+
+# Local container and orchestration overrides
+docker-compose.override.yml
+compose.override.yml
+.docker/
+
+# Editors, IDEs, and local agent state
+.idea/
+.vscode/
+.fleet/
+.zed/
+.codex/
+.claude/
+.agents/
+*.code-workspace
+*.swp
+*.swo
+.project
+.classpath
+.settings/
+
+# Operating-system metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# Logs, temporary files, and local process state
+*.log
+*.pid
+*.pid.lock
+*.tmp
+*.temp
+*.bak
+*.orig
+*~
+.cache/
+.tmp/
+tmp/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.mobileprovision
+credentials.json
+secrets.json

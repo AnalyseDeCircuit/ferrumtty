@@ -1,0 +1,33 @@
+[advisories]
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+exceptions = [
+    { allow = ["GPL-3.0-only"], crate = "ferrumtty-client" },
+    { allow = ["GPL-3.0-only"], crate = "ferrumtty-crypto" },
+    { allow = ["GPL-3.0-only"], crate = "ferrumtty-lab" },
+    { allow = ["GPL-3.0-only"], crate = "ferrumtty-predict" },
+    { allow = ["GPL-3.0-only"], crate = "ferrumtty-runtime" },
+    { allow = ["GPL-3.0-only"], crate = "ferrumtty-session" },
+    { allow = ["GPL-3.0-only"], crate = "ferrumtty-terminal" },
+    { allow = ["GPL-3.0-only"], crate = "ferrumtty-wire" },
+]
+
+[sources]
+unknown-git = "deny"
+unknown-registry = "deny"

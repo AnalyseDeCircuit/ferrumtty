@@ -1,0 +1,15 @@
+[package]
+name = "ferrumtty-terminal"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+crossterm.workspace = true
+ferrumtty-wire = { version = "=0.0.0", path = "../ferrumtty-wire" }
+vt100.workspace = true
+
+[lints]
+workspace = true

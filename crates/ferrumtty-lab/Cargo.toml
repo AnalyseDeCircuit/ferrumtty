@@ -1,0 +1,20 @@
+[package]
+name = "ferrumtty-lab"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+aes.workspace = true
+base64.workspace = true
+flate2.workspace = true
+ocb3.workspace = true
+ferrumtty-crypto = { version = "=0.0.0", path = "../ferrumtty-crypto" }
+ferrumtty-session = { version = "=0.0.0", path = "../ferrumtty-session" }
+ferrumtty-wire = { version = "=0.0.0", path = "../ferrumtty-wire" }
+zeroize.workspace = true
+
+[lints]
+workspace = true

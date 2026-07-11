@@ -1,0 +1,13 @@
+#!/bin/sh
+
+# This script records package and binary identity without launching a session.
+set -eu
+
+printf 'package\t'
+dpkg-query --show --showformat='${Package}\t${Version}\t${Architecture}\n' mosh
+printf 'binary\t'
+sha256sum /usr/bin/mosh-server
+printf 'version\t'
+/usr/bin/mosh-server --version 2>&1
+printf 'dependencies\n'
+ldd /usr/bin/mosh-server

@@ -1,0 +1,27 @@
+ARG BASE_IMAGE="public.ecr.aws/debian/debian@sha256:0a626fa3e0fe125d3e555d57f6c49558348d02d98a43628d8aa6fe8c407cf179"
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_SNAPSHOT="20250601T000000Z"
+ARG MOSH_PACKAGE_VERSION="1.4.0-1+b1"
+
+# Debian Snapshot metadata is signed by Debian; HTTP avoids a bootstrap CA package.
+RUN printf '%s\n' \
+        "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bookworm main" \
+        > /etc/apt/sources.list \
+    && rm -f /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        "mosh=${MOSH_PACKAGE_VERSION}" \
+        iproute2 \
+        procps \
+        tcpdump \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ferrumtty-server-identity /usr/local/bin/ferrumtty-server-identity
+
+RUN chmod 0755 /usr/local/bin/ferrumtty-server-identity
+
+ENV LANG=C.UTF-8
+ENV TERM=xterm-256color
+
+ENTRYPOINT ["/usr/bin/mosh-server"]

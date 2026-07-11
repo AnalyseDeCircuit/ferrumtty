@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/ferrumtty-client",
+    "crates/ferrumtty-crypto",
+    "crates/ferrumtty-lab",
+    "crates/ferrumtty-predict",
+    "crates/ferrumtty-runtime",
+    "crates/ferrumtty-session",
+    "crates/ferrumtty-terminal",
+    "crates/ferrumtty-wire",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-only"
+rust-version = "1.85"
+
+[workspace.dependencies]
+aes = { version = "0.8.4", features = ["zeroize"] }
+base64 = "0.22.1"
+crossterm = { version = "0.29.0", default-features = false, features = ["bracketed-paste", "events", "windows"] }
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+ocb3 = { version = "0.1.0", default-features = false, features = ["alloc"] }
+prost = "0.14.4"
+signal-hook = "0.3.18"
+vt100 = "0.16.2"
+zeroize = "1.8.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

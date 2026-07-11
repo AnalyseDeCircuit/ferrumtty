@@ -1,0 +1,14 @@
+[package]
+name = "ferrumtty-session"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ferrumtty-crypto = { version = "=0.0.0", path = "../ferrumtty-crypto" }
+ferrumtty-wire = { version = "=0.0.0", path = "../ferrumtty-wire" }
+
+[lints]
+workspace = true
