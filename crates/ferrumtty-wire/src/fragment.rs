@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 const FRAGMENT_HEADER_BYTES: usize = 14;
 const FINAL_FRAGMENT_BIT: u16 = 1_u16 << 15;
@@ -18,10 +19,20 @@ pub struct FragmentHeader {
 }
 
 /// An authenticated plaintext fragment.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Fragment {
     pub header: FragmentHeader,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for Fragment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Fragment")
+            .field("header", &self.header)
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 impl Fragment {
@@ -234,6 +245,16 @@ mod tests {
     use super::{Fragment, FragmentAccumulator, FragmentError, MAX_FRAGMENT_BODY_BYTES};
 
     #[test]
+    fn fragment_debug_redacts_body() {
+        let fragment = Fragment::split(b"fragment-body-sentinel", 1, 2, 3)
+            .expect("fragment must split")
+            .remove(0);
+        let output = format!("{fragment:?}");
+        assert!(!output.contains("fragment-body-sentinel"));
+        assert!(output.contains("body_bytes"));
+    }
+
+    #[test]
     fn splits_and_reassembles_out_of_order() {
         let message = vec![0x5a; MAX_FRAGMENT_BODY_BYTES * 2 + 17];
         let fragments = Fragment::split(&message, 0x1234, 0xffff, 7).expect("split must work");
@@ -245,6 +266,15 @@ mod tests {
         assert_eq!(accumulator.push(fragments[1].clone()), Ok(None));
         assert_eq!(accumulator.push(fragments[2].clone()), Ok(None));
         assert_eq!(accumulator.push(fragments[0].clone()), Ok(Some(message)));
+    }
+
+    #[test]
+    fn fragment_header_preserves_shutdown_state_number() {
+        let fragment = Fragment::split(b"shutdown", 1, 2, u64::MAX)
+            .expect("shutdown fragment must split")
+            .remove(0);
+        let parsed = Fragment::parse(&fragment.encode()).expect("shutdown fragment must parse");
+        assert_eq!(parsed.header.state_id, u64::MAX);
     }
 
     #[test]

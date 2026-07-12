@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::ocb_probe::encode_hex;
 use flate2::read::ZlibDecoder;
 use std::io::Read;
 
@@ -17,9 +16,9 @@ pub(crate) fn inspect_transport_plaintext(plaintext: &[u8]) -> Result<(), String
         .map_err(|error| format!("failed to decompress authenticated payload: {error}"))?;
 
     println!(
-        "transport_prefix_hex={} protobuf_hex={}",
-        encode_hex(&plaintext[..compressed_offset]),
-        encode_hex(&message)
+        "transport_prefix_bytes={} protobuf_bytes={}",
+        compressed_offset,
+        message.len()
     );
     for field in parse_fields(&message)? {
         match field.value {
@@ -28,10 +27,9 @@ pub(crate) fn inspect_transport_plaintext(plaintext: &[u8]) -> Result<(), String
             }
             FieldValue::Bytes(value) => {
                 println!(
-                    "protobuf_field={} wire=bytes length={} value_hex={}",
+                    "protobuf_field={} wire=bytes length={}",
                     field.number,
-                    value.len(),
-                    encode_hex(value)
+                    value.len()
                 );
             }
         }

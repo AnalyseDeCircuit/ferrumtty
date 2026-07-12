@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::ocb_probe::{decode_hex, encode_hex};
+use crate::ocb_probe::decode_hex;
 use crate::protobuf_probe::inspect_transport_plaintext;
 use ferrumtty_crypto::{PeerRole, SecureChannel, SessionKey};
 use ferrumtty_wire::{Fragment, decode_compressed_update};
@@ -12,9 +12,9 @@ pub(crate) fn run_from_stdin(receiver_role: PeerRole) -> Result<(), String> {
     let authenticated = read_and_open(receiver_role)?;
 
     println!(
-        "production channel authenticated counter={} plaintext_hex={}",
+        "production channel authenticated counter={} plaintext_bytes={}",
         authenticated.counter,
-        encode_hex(&authenticated.plaintext)
+        authenticated.plaintext.len()
     );
     inspect_transport_plaintext(&authenticated.plaintext)?;
     let fragment = Fragment::parse(&authenticated.plaintext)
@@ -42,15 +42,15 @@ pub(crate) fn run_from_stdin(receiver_role: PeerRole) -> Result<(), String> {
 pub(crate) fn run_fragment_from_stdin(receiver_role: PeerRole) -> Result<(), String> {
     const TRANSPORT_PREFIX_BYTES: usize = 14;
     let authenticated = read_and_open(receiver_role)?;
-    let (prefix, fragment_body) = authenticated
+    let (transport_prefix, fragment_body) = authenticated
         .plaintext
         .split_at_checked(TRANSPORT_PREFIX_BYTES)
         .ok_or("authenticated fragment is shorter than its prefix")?;
 
     println!(
-        "production channel authenticated counter={} transport_prefix_hex={} fragment_body_bytes={}",
+        "production channel authenticated counter={} transport_prefix_bytes={} fragment_body_bytes={}",
         authenticated.counter,
-        encode_hex(prefix),
+        transport_prefix.len(),
         fragment_body.len()
     );
     Ok(())

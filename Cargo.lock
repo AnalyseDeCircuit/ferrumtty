@@ -258,7 +258,17 @@ name = "ferrumtty-session"
 version = "0.0.0"
 dependencies = [
  "ferrumtty-crypto",
+ "ferrumtty-state",
  "ferrumtty-wire",
+]
+
+[[package]]
+name = "ferrumtty-state"
+version = "0.0.0"
+dependencies = [
+ "ferrumtty-wire",
+ "vt100",
+ "vte",
 ]
 
 [[package]]
@@ -267,7 +277,9 @@ version = "0.0.0"
 dependencies = [
  "crossterm",
  "ferrumtty-wire",
+ "rustix",
  "vt100",
+ "vte",
 ]
 
 [[package]]

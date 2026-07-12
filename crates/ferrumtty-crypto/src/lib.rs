@@ -185,10 +185,20 @@ impl SecureChannel {
 }
 
 /// Plaintext is constructible only after successful authentication.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct AuthenticatedPacket {
     pub counter: u64,
     pub plaintext: Vec<u8>,
+}
+
+impl fmt::Debug for AuthenticatedPacket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedPacket")
+            .field("counter", &self.counter)
+            .field("plaintext_bytes", &self.plaintext.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,12 +228,23 @@ fn make_nonce(prefix: [u8; PACKET_PREFIX_BYTES]) -> [u8; OCB_NONCE_BYTES] {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpenError, PeerRole, SecureChannel, SessionKey};
+    use super::{AuthenticatedPacket, OpenError, PeerRole, SecureChannel, SessionKey};
     use aes::Aes128;
     use ocb3::Ocb3;
     use ocb3::aead::{Aead, KeyInit, Payload, generic_array::GenericArray};
 
     const SYNTHETIC_KEY: &str = "AAECAwQFBgcICQoLDA0ODw";
+
+    #[test]
+    fn authenticated_packet_debug_redacts_plaintext() {
+        let packet = AuthenticatedPacket {
+            counter: 7,
+            plaintext: b"debug-plaintext-sentinel".to_vec(),
+        };
+        let output = format!("{packet:?}");
+        assert!(!output.contains("debug-plaintext-sentinel"));
+        assert!(output.contains("plaintext_bytes: 24"));
+    }
 
     #[test]
     fn matches_rfc_7253_vector_with_plaintext_and_aad() {

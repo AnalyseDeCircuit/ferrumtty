@@ -6,6 +6,7 @@ members = [
     "crates/ferrumtty-predict",
     "crates/ferrumtty-runtime",
     "crates/ferrumtty-session",
+    "crates/ferrumtty-state",
     "crates/ferrumtty-terminal",
     "crates/ferrumtty-wire",
 ]
@@ -25,7 +26,9 @@ flate2 = { version = "1.1.9", default-features = false, features = ["rust_backen
 ocb3 = { version = "0.1.0", default-features = false, features = ["alloc"] }
 prost = "0.14.4"
 signal-hook = "0.3.18"
+rustix = { version = "1.1.4", features = ["termios"] }
 vt100 = "0.16.2"
+vte = "0.15.0"
 zeroize = "1.8.1"
 
 [workspace.lints.rust]

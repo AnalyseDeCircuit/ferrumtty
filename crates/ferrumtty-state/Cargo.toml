@@ -1,5 +1,5 @@
 [package]
-name = "ferrumtty-session"
+name = "ferrumtty-state"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-ferrumtty-crypto = { version = "=0.0.0", path = "../ferrumtty-crypto" }
-ferrumtty-state = { version = "=0.0.0", path = "../ferrumtty-state" }
 ferrumtty-wire = { version = "=0.0.0", path = "../ferrumtty-wire" }
+vt100.workspace = true
+vte.workspace = true
 
 [lints]
 workspace = true

@@ -3,16 +3,21 @@
 //! Client-side protocol state independent of sockets and terminal adapters.
 
 use ferrumtty_crypto::{OpenError, PeerRole, SealError, SecureChannel, SessionKey};
+use ferrumtty_state::{RemoteTerminalState, StateError};
 use ferrumtty_wire::{
-    Fragment, FragmentAccumulator, FragmentError, InstructionBatch, MessageError, StateUpdate,
-    decode_compressed_update, encode_compressed_update,
+    Fragment, FragmentAccumulator, FragmentError, Instruction, InstructionBatch, MessageError,
+    StateUpdate, decode_compressed_update, encode_compressed_update,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 const NO_ECHO_TIMESTAMP: u16 = u16::MAX;
 const MAXIMUM_REASSEMBLED_BYTES: usize = 16 * 1024 * 1024;
 const MAXIMUM_ACTIVE_ASSEMBLIES: usize = 64;
+const MAXIMUM_SENT_STATES: usize = 32;
+const MAXIMUM_RECEIVED_STATES: usize = 1_024;
 const REPLAY_WINDOW_BITS: u64 = 128;
+const DEFAULT_REMOTE_COLUMNS: u16 = 80;
+const DEFAULT_REMOTE_ROWS: u16 = 24;
 
 /// Produces authenticated client updates and accepts authenticated server states.
 pub struct ClientProtocol {
@@ -21,20 +26,35 @@ pub struct ClientProtocol {
     latest_remote_state: u64,
     latest_peer_timestamp: Option<u16>,
     assemblies: BTreeMap<u64, FragmentAccumulator>,
-    pending_update: Option<PendingUpdate>,
+    local_instructions: Vec<Instruction>,
+    sent_states: VecDeque<SentState>,
+    received_states: BTreeMap<u64, RemoteTerminalState>,
+    delivered_remote_state: RemoteTerminalState,
+    remote_throwaway_floor: u64,
     replay_window: ReplayWindow,
 }
 
 impl ClientProtocol {
     #[must_use]
+    #[allow(clippy::missing_panics_doc)]
     pub fn new(key: SessionKey) -> Self {
+        let initial_remote_state =
+            RemoteTerminalState::new(DEFAULT_REMOTE_COLUMNS, DEFAULT_REMOTE_ROWS)
+                .expect("the default remote viewport is valid");
         Self {
             secure_channel: SecureChannel::new(PeerRole::Client, key),
             next_local_state: 1,
             latest_remote_state: 0,
             latest_peer_timestamp: None,
             assemblies: BTreeMap::new(),
-            pending_update: None,
+            local_instructions: Vec::new(),
+            sent_states: VecDeque::from([SentState {
+                state_id: 0,
+                instruction_end: 0,
+            }]),
+            received_states: BTreeMap::from([(0, initial_remote_state.clone())]),
+            delivered_remote_state: initial_remote_state,
+            remote_throwaway_floor: 0,
             replay_window: ReplayWindow::default(),
         }
     }
@@ -50,15 +70,85 @@ impl ClientProtocol {
         sent_timestamp: u16,
         instructions: &InstructionBatch,
     ) -> Result<Vec<Vec<u8>>, SessionError> {
-        if self.pending_update.is_some() {
-            return Err(SessionError::UpdateAwaitingAcknowledgement);
-        }
         let target_state = self.next_local_state;
-        let base_state = target_state
-            .checked_sub(1)
+        if target_state == u64::MAX {
+            return Err(SessionError::StateExhausted);
+        }
+        let packets = self.build_state_update(sent_timestamp, instructions, target_state)?;
+        self.next_local_state = target_state + 1;
+        Ok(packets)
+    }
+
+    /// Encodes the reserved SSP shutdown state with any final queued input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shutdown was already sent, state history is
+    /// unavailable, or encoding and authentication fail.
+    pub fn build_shutdown(
+        &mut self,
+        sent_timestamp: u16,
+        instructions: &InstructionBatch,
+    ) -> Result<Vec<Vec<u8>>, SessionError> {
+        if self.local_shutdown_sent() {
+            return Err(SessionError::ShutdownAlreadySent);
+        }
+        self.build_state_update(sent_timestamp, instructions, u64::MAX)
+    }
+
+    /// Re-sends the reserved local shutdown state to acknowledge a peer
+    /// shutdown request after the peer has already acknowledged local state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the acknowledged local shutdown state is the
+    /// only retained state, or if encoding and authentication fail.
+    pub fn build_shutdown_ack(
+        &mut self,
+        sent_timestamp: u16,
+    ) -> Result<Vec<Vec<u8>>, SessionError> {
+        if !self.local_shutdown_acknowledged() {
+            return Err(SessionError::ShutdownNotAcknowledged);
+        }
+        let mut update = StateUpdate::new(u64::MAX, u64::MAX, self.latest_remote_state);
+        update.discard_before = u64::MAX;
+        update.delta = InstructionBatch {
+            instructions: Vec::new(),
+        }
+        .encode_bytes();
+        let compressed = encode_compressed_update(&update).map_err(SessionError::Message)?;
+        seal_fragments(
+            &mut self.secure_channel,
+            &compressed,
+            sent_timestamp,
+            self.latest_peer_timestamp,
+            u64::MAX,
+        )
+    }
+
+    fn build_state_update(
+        &mut self,
+        sent_timestamp: u16,
+        instructions: &InstructionBatch,
+        target_state: u64,
+    ) -> Result<Vec<Vec<u8>>, SessionError> {
+        let base_state = self
+            .sent_states
+            .back()
+            .ok_or(SessionError::StateHistoryUnavailable)?
+            .state_id;
+        let discard_before = self
+            .sent_states
+            .front()
+            .ok_or(SessionError::StateHistoryUnavailable)?
+            .state_id;
+        let instruction_end = self
+            .local_instructions
+            .len()
+            .checked_add(instructions.instructions.len())
             .ok_or(SessionError::StateExhausted)?;
         let mut update = StateUpdate::new(base_state, target_state, self.latest_remote_state);
-        update.discard_before = base_state;
+        update.discard_before = discard_before;
         update.delta = instructions.encode_bytes();
         let compressed = encode_compressed_update(&update).map_err(SessionError::Message)?;
         let packets = seal_fragments(
@@ -68,17 +158,18 @@ impl ClientProtocol {
             self.latest_peer_timestamp,
             target_state,
         )?;
-        self.pending_update = Some(PendingUpdate {
+        self.local_instructions
+            .extend(instructions.instructions.iter().cloned());
+        self.sent_states.push_back(SentState {
             state_id: target_state,
-            compressed,
+            instruction_end,
         });
-        self.next_local_state = target_state
-            .checked_add(1)
-            .ok_or(SessionError::StateExhausted)?;
+        self.limit_sent_states();
         Ok(packets)
     }
 
-    /// Re-encrypts the pending state with fresh packet counters after a timeout.
+    /// Rebuilds all unacknowledged input from the confirmed state and seals it
+    /// with fresh packet counters after a timeout.
     ///
     /// # Errors
     ///
@@ -88,16 +179,36 @@ impl ClientProtocol {
         &mut self,
         sent_timestamp: u16,
     ) -> Result<Vec<Vec<u8>>, SessionError> {
-        let pending = self
-            .pending_update
-            .as_ref()
-            .ok_or(SessionError::NoPendingUpdate)?;
+        if !self.has_pending_update() {
+            return Err(SessionError::NoPendingUpdate);
+        }
+        let confirmed = self
+            .sent_states
+            .front()
+            .ok_or(SessionError::StateHistoryUnavailable)?;
+        let latest = self
+            .sent_states
+            .back()
+            .ok_or(SessionError::StateHistoryUnavailable)?;
+        let instructions = InstructionBatch {
+            instructions: self.local_instructions
+                [confirmed.instruction_end..latest.instruction_end]
+                .to_vec(),
+        };
+        let mut update = StateUpdate::new(
+            confirmed.state_id,
+            latest.state_id,
+            self.latest_remote_state,
+        );
+        update.discard_before = confirmed.state_id;
+        update.delta = instructions.encode_bytes();
+        let compressed = encode_compressed_update(&update).map_err(SessionError::Message)?;
         seal_fragments(
             &mut self.secure_channel,
-            &pending.compressed,
+            &compressed,
             sent_timestamp,
             self.latest_peer_timestamp,
-            pending.state_id,
+            latest.state_id,
         )
     }
 
@@ -131,24 +242,17 @@ impl ClientProtocol {
         };
         self.assemblies.remove(&header.state_id);
         let update = decode_compressed_update(&compressed).map_err(SessionError::Message)?;
-        if self
-            .pending_update
-            .as_ref()
-            .is_some_and(|pending| update.acknowledged_state >= pending.state_id)
-        {
-            self.pending_update = None;
+        if update.target_state != header.state_id {
+            return Err(SessionError::Fragment(FragmentError::MismatchedState));
         }
-        let advances_remote_state = update.target_state > self.latest_remote_state
-            && update.base_state == self.latest_remote_state;
-        if advances_remote_state {
-            self.latest_remote_state = update.target_state;
-        }
+        self.process_acknowledgement(update.acknowledged_state);
+        let (advances_remote_state, delivered_update) = self.accept_remote_update(update)?;
         Ok(Some(ReceivedState {
             packet_counter: authenticated.counter,
             sent_timestamp: header.sent_timestamp,
             echoed_timestamp: header.echoed_timestamp,
             advances_remote_state,
-            update,
+            update: delivered_update,
         }))
     }
 
@@ -157,15 +261,134 @@ impl ClientProtocol {
         self.latest_remote_state
     }
 
+    /// Returns the state number that will contain newly queued input.
+    #[must_use]
+    pub fn next_local_state(&self) -> u64 {
+        self.next_local_state
+    }
+
+    /// Returns the newest local state represented by pending transport history.
+    #[must_use]
+    pub fn latest_local_state(&self) -> u64 {
+        self.sent_states.back().map_or(0, |state| state.state_id)
+    }
+
+    /// Updates the blank remote baseline before the first server state arrives.
+    pub fn set_initial_remote_viewport(&mut self, columns: u16, rows: u16) {
+        if self.latest_remote_state != 0 || self.received_states.len() != 1 {
+            return;
+        }
+        let Ok(initial_state) = RemoteTerminalState::new(columns.max(1), rows.max(1)) else {
+            return;
+        };
+        self.received_states.insert(0, initial_state.clone());
+        self.delivered_remote_state = initial_state;
+    }
+
     #[must_use]
     pub fn has_pending_update(&self) -> bool {
-        self.pending_update.is_some()
+        self.sent_states.len() > 1
+    }
+
+    #[must_use]
+    pub fn local_shutdown_sent(&self) -> bool {
+        self.sent_states
+            .back()
+            .is_some_and(|state| state.state_id == u64::MAX)
+    }
+
+    #[must_use]
+    pub fn local_shutdown_acknowledged(&self) -> bool {
+        self.sent_states
+            .front()
+            .is_some_and(|state| state.state_id == u64::MAX)
+    }
+
+    #[must_use]
+    pub const fn remote_shutdown_received(&self) -> bool {
+        self.latest_remote_state == u64::MAX
+    }
+
+    fn process_acknowledgement(&mut self, acknowledged_state: u64) {
+        let Some(acknowledged_index) = self
+            .sent_states
+            .iter()
+            .position(|state| state.state_id == acknowledged_state)
+        else {
+            return;
+        };
+        self.sent_states.drain(..acknowledged_index);
+
+        let confirmed_instruction_end = self
+            .sent_states
+            .front()
+            .expect("an exact acknowledgement leaves its state in history")
+            .instruction_end;
+        if confirmed_instruction_end == 0 {
+            return;
+        }
+        self.local_instructions.drain(..confirmed_instruction_end);
+        for state in &mut self.sent_states {
+            state.instruction_end -= confirmed_instruction_end;
+        }
+    }
+
+    fn limit_sent_states(&mut self) {
+        while self.sent_states.len() > MAXIMUM_SENT_STATES {
+            // Match Mosh's bounded-history policy by removing a middle state
+            // while preserving the confirmed front and the newest states.
+            let removal_index = self.sent_states.len() - 16;
+            self.sent_states.remove(removal_index);
+        }
+    }
+
+    fn accept_remote_update(
+        &mut self,
+        update: StateUpdate,
+    ) -> Result<(bool, StateUpdate), SessionError> {
+        if self.received_states.contains_key(&update.target_state) {
+            return Ok((false, update));
+        }
+        if update.discard_before > update.base_state || update.target_state <= update.base_state {
+            return Err(SessionError::InvalidStateTransition);
+        }
+        let Some(mut target_state) = self.received_states.get(&update.base_state).cloned() else {
+            return Ok((false, update));
+        };
+        let instructions = update
+            .decode_instructions()
+            .map_err(SessionError::Message)?;
+        target_state
+            .apply(&instructions)
+            .map_err(SessionError::State)?;
+
+        let throwaway_floor = self.remote_throwaway_floor.max(update.discard_before);
+        self.received_states
+            .retain(|state_id, _| *state_id >= throwaway_floor);
+        self.remote_throwaway_floor = throwaway_floor;
+        if self.received_states.len() >= MAXIMUM_RECEIVED_STATES {
+            return Err(SessionError::TooManyRemoteStates);
+        }
+        self.received_states
+            .insert(update.target_state, target_state.clone());
+
+        if update.target_state <= self.latest_remote_state {
+            return Ok((false, update));
+        }
+        let Ok(diff) = target_state.diff_from(&self.delivered_remote_state) else {
+            return Ok((false, update));
+        };
+        let mut delivered_update = update;
+        delivered_update.delta = diff.into_instructions().encode_bytes();
+        self.latest_remote_state = delivered_update.target_state;
+        self.delivered_remote_state = target_state;
+        Ok((true, delivered_update))
     }
 }
 
-struct PendingUpdate {
+struct SentState {
     state_id: u64,
-    compressed: Vec<u8>,
+    instruction_end: usize,
 }
 
 #[derive(Default)]
@@ -229,7 +452,7 @@ fn seal_fragments(
         .collect()
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct ReceivedState {
     pub packet_counter: u64,
     pub sent_timestamp: u16,
@@ -238,13 +461,36 @@ pub struct ReceivedState {
     pub update: StateUpdate,
 }
 
+impl std::fmt::Debug for ReceivedState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReceivedState")
+            .field("packet_counter", &self.packet_counter)
+            .field("sent_timestamp", &self.sent_timestamp)
+            .field("echoed_timestamp", &self.echoed_timestamp)
+            .field("advances_remote_state", &self.advances_remote_state)
+            .field("base_state", &self.update.base_state)
+            .field("target_state", &self.update.target_state)
+            .field("acknowledged_state", &self.update.acknowledged_state)
+            .field("discard_before", &self.update.discard_before)
+            .field("delta_bytes", &self.update.delta.len())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub enum SessionError {
     StateExhausted,
+    ShutdownAlreadySent,
+    ShutdownNotAcknowledged,
+    StateHistoryUnavailable,
     UpdateAwaitingAcknowledgement,
     NoPendingUpdate,
     ReplayDetected,
     TooManyActiveAssemblies,
+    TooManyRemoteStates,
+    InvalidStateTransition,
+    State(StateError),
     Seal(SealError),
     Open(OpenError),
     Fragment(FragmentError),
@@ -253,14 +499,31 @@ pub enum SessionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientProtocol, ReplayWindow};
+    use super::{ClientProtocol, ReceivedState, ReplayWindow};
     use ferrumtty_crypto::{PeerRole, SecureChannel, SessionKey};
+    use ferrumtty_state::RemoteTerminalState;
     use ferrumtty_wire::{
         ByteRun, Fragment, Instruction, InstructionBatch, StateUpdate, decode_compressed_update,
         encode_compressed_update,
     };
 
     const SYNTHETIC_KEY: &str = "AAECAwQFBgcICQoLDA0ODw";
+
+    #[test]
+    fn received_state_debug_redacts_terminal_delta() {
+        let mut update = StateUpdate::new(1, 2, 3);
+        update.delta = b"terminal-delta-sentinel".to_vec();
+        let state = ReceivedState {
+            packet_counter: 4,
+            sent_timestamp: 5,
+            echoed_timestamp: 6,
+            advances_remote_state: true,
+            update,
+        };
+        let output = format!("{state:?}");
+        assert!(!output.contains("terminal-delta-sentinel"));
+        assert!(output.contains("delta_bytes: 23"));
+    }
 
     #[test]
     fn initial_update_matches_observed_state_shape() {
@@ -356,6 +619,230 @@ mod tests {
     }
 
     #[test]
+    fn multiple_unacknowledged_states_retransmit_from_confirmed_front() {
+        let mut client = ClientProtocol::new(key());
+        let first = input_batch(b"first");
+        let second = input_batch(b"second");
+        let third = input_batch(b"third");
+
+        let first_update = decode_client_update(
+            &client
+                .build_update(1, &first)
+                .expect("first state must encode")[0],
+        );
+        let second_update = decode_client_update(
+            &client
+                .build_update(2, &second)
+                .expect("second state must encode")[0],
+        );
+        let third_update = decode_client_update(
+            &client
+                .build_update(3, &third)
+                .expect("third state must encode")[0],
+        );
+
+        assert_eq!((first_update.base_state, first_update.target_state), (0, 1));
+        assert_eq!(
+            (second_update.base_state, second_update.target_state),
+            (1, 2)
+        );
+        assert_eq!((third_update.base_state, third_update.target_state), (2, 3));
+        assert_eq!(third_update.discard_before, 0);
+
+        let retransmitted = client
+            .retransmit_pending(4)
+            .expect("all pending input must retransmit");
+        let retransmitted_update = decode_client_update(&retransmitted[0]);
+        assert_eq!(
+            (
+                retransmitted_update.base_state,
+                retransmitted_update.target_state,
+                retransmitted_update.discard_before,
+            ),
+            (0, 3, 0)
+        );
+        let values = retransmitted_update
+            .decode_instructions()
+            .expect("retransmitted instructions must decode")
+            .instructions
+            .into_iter()
+            .map(|instruction| instruction.bytes.expect("input bytes must exist").value)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            [b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+    }
+
+    #[test]
+    fn acknowledgements_require_an_exact_retained_state() {
+        let mut client = ClientProtocol::new(key());
+        client
+            .build_update(1, &input_batch(b"first"))
+            .expect("first state must encode");
+        client
+            .build_update(2, &input_batch(b"second"))
+            .expect("second state must encode");
+        let mut server = SecureChannel::new(PeerRole::Server, key());
+
+        let unknown_update = StateUpdate::new(0, 1, 99);
+        let unknown_ack = server_update_packet(&mut server, &unknown_update, 1);
+        client
+            .ingest(&unknown_ack)
+            .expect("unknown acknowledgement packet must open");
+        assert!(client.has_pending_update());
+        assert_eq!(
+            client
+                .sent_states
+                .front()
+                .expect("front must exist")
+                .state_id,
+            0
+        );
+
+        let exact_update = StateUpdate::new(1, 2, 1);
+        let exact_ack = server_update_packet(&mut server, &exact_update, 2);
+        client
+            .ingest(&exact_ack)
+            .expect("exact acknowledgement packet must open");
+        assert_eq!(
+            client
+                .sent_states
+                .front()
+                .expect("front must exist")
+                .state_id,
+            1
+        );
+        let retransmitted = decode_client_update(
+            &client
+                .retransmit_pending(3)
+                .expect("second state must remain pending")[0],
+        );
+        assert_eq!(
+            (
+                retransmitted.base_state,
+                retransmitted.target_state,
+                retransmitted.discard_before,
+            ),
+            (1, 2, 1)
+        );
+        assert_eq!(
+            retransmitted
+                .decode_instructions()
+                .expect("remaining suffix must decode")
+                .instructions[0]
+                .bytes
+                .as_ref()
+                .expect("remaining input must exist")
+                .value,
+            b"second"
+        );
+
+        let latest_update = StateUpdate::new(2, 3, 2);
+        let latest_ack = server_update_packet(&mut server, &latest_update, 3);
+        client
+            .ingest(&latest_ack)
+            .expect("latest acknowledgement packet must open");
+        assert!(!client.has_pending_update());
+        assert_eq!(client.local_instructions.len(), 0);
+    }
+
+    #[test]
+    fn sent_history_is_bounded_without_losing_front_or_latest() {
+        let mut client = ClientProtocol::new(key());
+        let empty = InstructionBatch {
+            instructions: Vec::new(),
+        };
+        for timestamp in 1..=40 {
+            client
+                .build_update(timestamp, &empty)
+                .expect("bounded state must encode");
+        }
+
+        assert_eq!(client.sent_states.len(), super::MAXIMUM_SENT_STATES);
+        assert_eq!(
+            client
+                .sent_states
+                .front()
+                .expect("front must exist")
+                .state_id,
+            0
+        );
+        assert_eq!(
+            client.sent_states.back().expect("back must exist").state_id,
+            40
+        );
+    }
+
+    #[test]
+    fn maximum_state_number_is_reserved_as_a_sentinel() {
+        let mut client = ClientProtocol::new(key());
+        client.next_local_state = u64::MAX - 1;
+        let empty = InstructionBatch {
+            instructions: Vec::new(),
+        };
+
+        client
+            .build_update(1, &empty)
+            .expect("last ordinary state must encode");
+        assert_eq!(client.next_local_state, u64::MAX);
+        assert!(matches!(
+            client.build_update(2, &empty),
+            Err(super::SessionError::StateExhausted)
+        ));
+        assert_eq!(
+            client.sent_states.back().expect("back must exist").state_id,
+            u64::MAX - 1
+        );
+    }
+
+    #[test]
+    fn shutdown_state_is_retransmitted_until_exactly_acknowledged() {
+        let mut client = ClientProtocol::new(key());
+        let mut server = SecureChannel::new(PeerRole::Server, key());
+        let final_input = input_batch(b"final");
+
+        let packets = client
+            .build_shutdown(1, &final_input)
+            .expect("shutdown state must encode");
+        let shutdown = decode_client_update(&packets[0]);
+        assert_eq!((shutdown.base_state, shutdown.target_state), (0, u64::MAX));
+        assert!(client.local_shutdown_sent());
+        assert!(!client.local_shutdown_acknowledged());
+
+        let retransmitted = client
+            .retransmit_pending(2)
+            .expect("shutdown state must retransmit");
+        assert_eq!(
+            decode_client_update(&retransmitted[0]).target_state,
+            u64::MAX
+        );
+
+        let acknowledgement = StateUpdate::new(0, 1, u64::MAX);
+        client
+            .ingest(&server_update_packet(&mut server, &acknowledgement, 1))
+            .expect("shutdown acknowledgement must authenticate");
+        assert!(client.local_shutdown_acknowledged());
+        assert!(!client.has_pending_update());
+    }
+
+    #[test]
+    fn rejects_fragment_identifier_that_differs_from_target_state() {
+        let mut client = ClientProtocol::new(key());
+        let mut server = SecureChannel::new(PeerRole::Server, key());
+        let update = StateUpdate::new(0, 1, 0);
+        let packet = server_update_packet(&mut server, &update, 2);
+
+        assert!(matches!(
+            client.ingest(&packet),
+            Err(super::SessionError::Fragment(
+                ferrumtty_wire::FragmentError::MismatchedState
+            ))
+        ));
+        assert_eq!(client.latest_remote_state(), 0);
+    }
+
+    #[test]
     fn replay_window_accepts_reordering_once() {
         let mut window = ReplayWindow::default();
 
@@ -430,7 +917,7 @@ mod tests {
         server_update.delta = instructions.encode_bytes();
         let compressed =
             encode_compressed_update(&server_update).expect("server state must compress");
-        let fragments = Fragment::split(&compressed, 3, 2, 77).expect("server state must fragment");
+        let fragments = Fragment::split(&compressed, 3, 2, 2).expect("server state must fragment");
         assert!(fragments.len() > 1);
 
         let mut server_writer = SecureChannel::new(
@@ -472,5 +959,128 @@ mod tests {
             client.ingest(&packets[0]),
             Err(super::SessionError::ReplayDetected)
         ));
+    }
+
+    #[test]
+    fn older_retained_remote_base_reconstructs_without_repeating_host_bytes() {
+        let mut client = ClientProtocol::new(key());
+        let mut server = SecureChannel::new(PeerRole::Server, key());
+
+        let first = remote_update(0, 1, 0, b"A");
+        let second = remote_update(1, 2, 0, b"B");
+        let rebuilt = remote_update(1, 3, 1, b"BC");
+        assert_eq!(
+            received_bytes(&mut client, &server_update_packet(&mut server, &first, 1)),
+            b"A"
+        );
+        assert_eq!(
+            received_bytes(&mut client, &server_update_packet(&mut server, &second, 2)),
+            b"B"
+        );
+        assert_eq!(
+            received_bytes(&mut client, &server_update_packet(&mut server, &rebuilt, 3)),
+            b"C"
+        );
+        assert_eq!(client.latest_remote_state(), 3);
+
+        let discarded_base = remote_update(0, 4, 0, b"ignored");
+        let packet = server_update_packet(&mut server, &discarded_base, 4);
+        let received = client
+            .ingest(&packet)
+            .expect("missing base is ignored")
+            .expect("complete packet is reported");
+        assert!(!received.advances_remote_state);
+        assert_eq!(client.latest_remote_state(), 3);
+    }
+
+    #[test]
+    fn diverged_plain_text_remote_state_converges_at_a_parser_boundary() {
+        let mut client = ClientProtocol::new(key());
+        let mut server = SecureChannel::new(PeerRole::Server, key());
+        let mut rendered = RemoteTerminalState::new(80, 24).expect("test viewport must be valid");
+
+        let first = remote_update(0, 1, 0, b"A");
+        let second = remote_update(1, 2, 0, b"B");
+        let replacement = remote_update(1, 3, 1, b"C");
+        for (update, fragment_state_id) in [(&first, 1), (&second, 2), (&replacement, 3)] {
+            let bytes = received_bytes(
+                &mut client,
+                &server_update_packet(&mut server, update, fragment_state_id),
+            );
+            rendered
+                .apply(&input_batch(&bytes))
+                .expect("delivered diff must render");
+        }
+
+        assert_eq!(client.latest_remote_state(), 3);
+        assert_eq!(rendered.screen().contents(), "AC");
+    }
+
+    fn key() -> SessionKey {
+        SessionKey::decode(SYNTHETIC_KEY).expect("synthetic key must decode")
+    }
+
+    fn input_batch(value: &[u8]) -> InstructionBatch {
+        InstructionBatch {
+            instructions: vec![Instruction {
+                bytes: Some(ByteRun {
+                    value: value.to_vec(),
+                }),
+                viewport: None,
+                marker: None,
+            }],
+        }
+    }
+
+    fn decode_client_update(packet: &[u8]) -> StateUpdate {
+        let server = SecureChannel::new(PeerRole::Server, key());
+        let plaintext = server
+            .open(packet)
+            .expect("client packet must authenticate")
+            .plaintext;
+        let fragment = Fragment::parse(&plaintext).expect("client packet must contain a fragment");
+        assert!(fragment.header.is_final);
+        decode_compressed_update(&fragment.body).expect("client state must decode")
+    }
+
+    fn server_update_packet(
+        server: &mut SecureChannel,
+        update: &StateUpdate,
+        fragment_state_id: u64,
+    ) -> Vec<u8> {
+        let compressed = encode_compressed_update(update).expect("server state must compress");
+        let fragment = Fragment::split(&compressed, 1, 0, fragment_state_id)
+            .expect("server state must fragment")
+            .remove(0);
+        server
+            .seal_next(&fragment.encode())
+            .expect("server packet must seal")
+    }
+
+    fn remote_update(
+        base_state: u64,
+        target_state: u64,
+        discard_before: u64,
+        bytes: &[u8],
+    ) -> StateUpdate {
+        let mut update = StateUpdate::new(base_state, target_state, 0);
+        update.discard_before = discard_before;
+        update.delta = input_batch(bytes).encode_bytes();
+        update
+    }
+
+    fn received_bytes(client: &mut ClientProtocol, packet: &[u8]) -> Vec<u8> {
+        client
+            .ingest(packet)
+            .expect("server state must open")
+            .expect("server state must complete")
+            .update
+            .decode_instructions()
+            .expect("instructions must decode")
+            .instructions
+            .into_iter()
+            .filter_map(|instruction| instruction.bytes)
+            .flat_map(|bytes| bytes.value)
+            .collect()
     }
 }

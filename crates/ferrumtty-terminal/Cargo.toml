@@ -10,6 +10,10 @@ publish = false
 crossterm.workspace = true
 ferrumtty-wire = { version = "=0.0.0", path = "../ferrumtty-wire" }
 vt100.workspace = true
+vte.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true

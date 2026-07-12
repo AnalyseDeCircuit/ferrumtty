@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+mod cli;
+mod diagnostics;
+
+use cli::{CliError, ClientConfig, Command, OutputTarget};
 use crossterm::event::{self, Event, KeyEventKind};
+use diagnostics::DiagnosticLogger;
 use ferrumtty_crypto::SessionKey;
-use ferrumtty_predict::{InputKind, PredictionDisplay, PredictionOverlay};
+use ferrumtty_predict::{
+    PredictionAction, PredictionContext, PredictionOverlay, PredictionReconciliation,
+};
 use ferrumtty_runtime::{MonotonicTime, RuntimeError, SessionAction, SessionRuntime};
 use ferrumtty_terminal::{
-    CursorKeyMode, EscapeAction, EscapeInterpreter, TerminalGuard, encode_focus,
-    encode_key_with_mode, encode_mouse, encode_paste, terminal_size,
+    EscapeAction, EscapeInterpreter, TerminalGuard, TitlePolicy, encode_focus_with_mode,
+    encode_key_with_mode, encode_mouse_with_mode, encode_paste_with_mode, terminal_size,
 };
 use std::env;
 use std::io::{self, IsTerminal};
@@ -20,157 +27,120 @@ use zeroize::{Zeroize, Zeroizing};
 const RECEIVE_BUFFER_BYTES: usize = 65_535;
 const LOOP_INTERVAL: Duration = Duration::from_millis(20);
 const SUSPEND_DETECTION_MILLISECONDS: u64 = 5_000;
-const DEFAULT_ESCAPE_BYTE: u8 = 0x1e;
 
-#[derive(Debug, Eq, PartialEq)]
-enum Command {
-    Colors,
-    Connect(ClientConfig),
+enum AppError {
+    Cli(CliError),
+    Runtime(String),
+    UncleanShutdown,
 }
 
-/// Holds CLI and environment settings at the client/runtime boundary.
-#[derive(Debug, Eq, PartialEq)]
-struct ClientConfig {
-    endpoint: String,
-    verbosity: u8,
-    escape_byte: u8,
-    title_no_prefix: bool,
-    prediction_display: PredictionDisplay,
-    prediction_overwrite: bool,
+impl From<CliError> for AppError {
+    fn from(error: CliError) -> Self {
+        Self::Cli(error)
+    }
+}
+
+impl From<String> for AppError {
+    fn from(error: String) -> Self {
+        Self::Runtime(error)
+    }
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
+    match dispatch() {
+        Ok(exit_code) => exit_code,
+        Err(AppError::Cli(error)) => {
+            write_cli_output(error.target(), error.message());
+            ExitCode::from(error.exit_code())
+        }
+        Err(AppError::Runtime(error)) => {
             eprintln!("{}: {error}", text(Text::ErrorPrefix));
+            ExitCode::FAILURE
+        }
+        Err(AppError::UncleanShutdown) => {
+            eprintln!("{}", text(Text::UncleanShutdown));
             ExitCode::FAILURE
         }
     }
 }
 
-fn run() -> Result<(), String> {
-    let command = parse_command(env::args(), |name| env::var(name).ok())?;
-    if command == Command::Colors {
-        println!("{}", crossterm::style::available_color_count());
-        return Ok(());
+fn write_cli_output(target: OutputTarget, message: &str) {
+    match target {
+        OutputTarget::Stdout => println!("{message}"),
+        OutputTarget::Stderr => eprintln!("{message}"),
     }
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Err(text(Text::TerminalRequired).to_owned());
+}
+
+fn dispatch() -> Result<ExitCode, AppError> {
+    let command = cli::parse_command(env::args(), |name| env::var(name).ok())?;
+    match command {
+        Command::Help { program } => {
+            write_cli_output(OutputTarget::Stdout, &cli::usage(&program));
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Version => {
+            write_cli_output(OutputTarget::Stdout, &cli::version());
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Colors => {
+            let platform =
+                cli::platform_color_capability(crossterm::style::available_color_count());
+            let color_count = cli::infer_color_count(
+                env::var("TERM").ok().as_deref(),
+                env::var("COLORTERM").ok().as_deref(),
+                platform,
+            );
+            println!("{color_count}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Connect(config) => {
+            run(&config)?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
-    let Command::Connect(config) = command else {
-        unreachable!("color mode returned before terminal setup")
-    };
-    write_debug_configuration(&config);
+}
+
+fn run(config: &ClientConfig) -> Result<(), AppError> {
     let key = read_session_key()?;
+    cli::validate_utf8_locale(|name| env::var(name).ok(), cfg!(windows))?;
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(text(Text::TerminalRequired).to_owned().into());
+    }
+    let logger = DiagnosticLogger::new(config.verbosity);
+    logger.write_startup(config);
     let socket = connect_socket(&config.endpoint)?;
     let termination_requested = install_termination_flag()?;
-    let mut terminal = TerminalGuard::enter()
+    let title_policy = if config.title_no_prefix {
+        TitlePolicy::PreserveRemote
+    } else {
+        TitlePolicy::MoshPrefix
+    };
+    let mut terminal = TerminalGuard::enter_with_title_policy(title_policy)
         .map_err(|error| format!("{}: {error}", text(Text::TerminalSetupFailed)))?;
     let started_at = Instant::now();
     let mut runtime = SessionRuntime::new(key, monotonic_time(started_at));
     let (columns, rows) =
         terminal_size().map_err(|error| format!("{}: {error}", text(Text::TerminalSizeFailed)))?;
     runtime.queue_resize(columns, rows);
-    event_loop(
+    let clean_shutdown = event_loop(
         &socket,
         &mut runtime,
         &mut terminal,
         started_at,
         &termination_requested,
-        &config,
-    )
-}
-
-fn parse_command<I, F>(arguments: I, environment: F) -> Result<Command, String>
-where
-    I: IntoIterator<Item = String>,
-    F: Fn(&str) -> Option<String>,
-{
-    let mut arguments = arguments.into_iter();
-    let program = arguments.next().unwrap_or_else(|| "ferrumtty".to_owned());
-    let remaining = arguments.collect::<Vec<_>>();
-    if remaining == ["-c"] {
-        return Ok(Command::Colors);
-    }
-    let mut verbosity = 0_u8;
-    let mut position = 0;
-    while let Some(argument) = remaining.get(position) {
-        if argument.len() < 2 || !argument.as_bytes()[1..].iter().all(|byte| *byte == b'v') {
-            break;
-        }
-        verbosity = verbosity.saturating_add(u8::try_from(argument.len() - 1).unwrap_or(u8::MAX));
-        position += 1;
-    }
-    let host = remaining.get(position).ok_or_else(|| usage(&program))?;
-    position += 1;
-    let port = remaining
-        .get(position)
-        .ok_or_else(|| usage(&program))?
-        .parse::<u16>()
-        .map_err(|_| usage(&program))?;
-    position += 1;
-    if position != remaining.len() || port == 0 {
-        return Err(usage(&program));
-    }
-    let escape_byte = environment("MOSH_ESCAPE_KEY")
-        .map_or(Ok(DEFAULT_ESCAPE_BYTE), |value| parse_escape_key(&value))?;
-    Ok(Command::Connect(ClientConfig {
-        endpoint: format!("{host}:{port}"),
-        verbosity,
-        escape_byte,
-        title_no_prefix: environment("MOSH_TITLE_NOPREFIX").is_some(),
-        prediction_display: parse_prediction_display(
-            environment("MOSH_PREDICTION_DISPLAY").as_deref(),
-        )?,
-        prediction_overwrite: environment("MOSH_PREDICTION_OVERWRITE").as_deref() == Some("yes"),
-    }))
-}
-
-fn parse_prediction_display(value: Option<&str>) -> Result<PredictionDisplay, String> {
-    match value.unwrap_or("adaptive") {
-        "adaptive" => Ok(PredictionDisplay::Adaptive),
-        "always" => Ok(PredictionDisplay::Always),
-        "never" => Ok(PredictionDisplay::Never),
-        _ => Err(text(Text::InvalidPredictionDisplay).to_owned()),
+        config,
+        &logger,
+    )?;
+    if clean_shutdown {
+        Ok(())
+    } else {
+        Err(AppError::UncleanShutdown)
     }
 }
 
-fn parse_escape_key(value: &str) -> Result<u8, String> {
-    let bytes = value.as_bytes();
-    if bytes.len() == 1 && matches!(bytes[0], 1..=127) {
-        return Ok(bytes[0]);
-    }
-    Err(text(Text::InvalidEscapeKey).to_owned())
-}
-
-fn write_debug_configuration(config: &ClientConfig) {
-    if config.verbosity == 0 {
-        return;
-    }
-    eprintln!("FerrumTTY: connecting to {}", config.endpoint);
-    if config.verbosity > 1 {
-        eprintln!(
-            "FerrumTTY: escape={} title_no_prefix={} prediction_display={:?} prediction_overwrite={:?}",
-            config.escape_byte,
-            config.title_no_prefix,
-            config.prediction_display,
-            config.prediction_overwrite
-        );
-    }
-}
-
-fn usage(program: &str) -> String {
-    format!(
-        "{}: {program} [-v...] HOST PORT\n       {program} -c",
-        text(Text::Usage)
-    )
-}
-
-fn read_session_key() -> Result<SessionKey, String> {
-    let mut encoded =
-        Zeroizing::new(env::var("MOSH_KEY").map_err(|_| text(Text::MissingKey).to_owned())?);
-    let key = SessionKey::decode(&encoded).map_err(|_| text(Text::InvalidKey).to_owned())?;
+fn read_session_key() -> Result<SessionKey, AppError> {
+    let mut encoded = Zeroizing::new(env::var("MOSH_KEY").map_err(|_| cli::missing_key_error())?);
+    let key = SessionKey::decode(&encoded).map_err(|_| cli::invalid_key_error())?;
     encoded.zeroize();
     Ok(key)
 }
@@ -220,17 +190,26 @@ fn event_loop(
     started_at: Instant,
     termination_requested: &AtomicBool,
     config: &ClientConfig,
-) -> Result<(), String> {
+    logger: &DiagnosticLogger,
+) -> Result<bool, String> {
     let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_BYTES];
     let mut predictor =
         PredictionOverlay::new(config.prediction_display, config.prediction_overwrite);
     let mut escape = EscapeInterpreter::new(config.escape_byte);
     let mut previous_poll = monotonic_time(started_at);
     let result = loop {
-        if termination_requested.load(Ordering::Relaxed) {
-            break Ok(());
-        }
         let now = monotonic_time(started_at);
+        if termination_requested.load(Ordering::Relaxed) {
+            let shutdown_result = runtime
+                .request_shutdown(now)
+                .map_err(format_runtime_error)
+                .and_then(|actions| {
+                    apply_actions(socket, terminal, &mut predictor, actions, logger)
+                });
+            if let Err(error) = shutdown_result {
+                break Err(error);
+            }
+        }
         if now
             .milliseconds()
             .saturating_sub(previous_poll.milliseconds())
@@ -246,23 +225,39 @@ fn event_loop(
             &mut predictor,
             &mut receive_buffer,
             now,
+            logger,
         ) {
-            Ok(true) => break Ok(()),
+            Ok(true) => break Ok(true),
             Ok(false) => {}
             Err(error) => break Err(error),
         }
         predictor.set_round_trip_milliseconds(runtime.round_trip_milliseconds());
-        match drain_terminal(runtime, terminal, &mut predictor, &mut escape) {
-            Ok(true) => break Ok(()),
-            Ok(false) => {}
-            Err(error) => break Err(error),
+        if !runtime.shutdown_in_progress() {
+            match drain_terminal(runtime, terminal, &mut predictor, &mut escape, started_at) {
+                Ok(true) => {
+                    let shutdown_result = runtime
+                        .request_shutdown(monotonic_time(started_at))
+                        .map_err(format_runtime_error)
+                        .and_then(|actions| {
+                            apply_actions(socket, terminal, &mut predictor, actions, logger)
+                        });
+                    if let Err(error) = shutdown_result {
+                        break Err(error);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => break Err(error),
+            }
         }
         let actions = match runtime.poll(now).map_err(format_runtime_error) {
             Ok(actions) => actions,
             Err(error) => break Err(error),
         };
-        if let Err(error) = apply_actions(socket, terminal, &mut predictor, actions) {
+        if let Err(error) = apply_actions(socket, terminal, &mut predictor, actions, logger) {
             break Err(error);
+        }
+        if let Some(outcome) = runtime.shutdown_outcome() {
+            break Ok(outcome != ferrumtty_runtime::ShutdownOutcome::TimedOut);
         }
         let wait_milliseconds = runtime
             .milliseconds_until_next_poll(monotonic_time(started_at))
@@ -299,6 +294,7 @@ fn drain_network(
     predictor: &mut PredictionOverlay,
     receive_buffer: &mut [u8],
     now: MonotonicTime,
+    logger: &DiagnosticLogger,
 ) -> Result<bool, String> {
     loop {
         let received = match socket.recv(receive_buffer) {
@@ -315,7 +311,7 @@ fn drain_network(
         let actions = runtime
             .receive_datagram(&receive_buffer[..received], now)
             .map_err(format_runtime_error)?;
-        apply_actions(socket, terminal, predictor, actions)?;
+        apply_actions(socket, terminal, predictor, actions, logger)?;
     }
 }
 
@@ -324,19 +320,49 @@ fn drain_terminal(
     terminal: &mut TerminalGuard,
     predictor: &mut PredictionOverlay,
     escape: &mut EscapeInterpreter,
+    started_at: Instant,
 ) -> Result<bool, String> {
     while event::poll(Duration::ZERO)
         .map_err(|error| format!("{}: {error}", text(Text::InputFailed)))?
     {
-        match event::read().map_err(|error| format!("{}: {error}", text(Text::InputFailed)))? {
+        let terminal_event =
+            event::read().map_err(|error| format!("{}: {error}", text(Text::InputFailed)))?;
+        terminal
+            .clear_local_notice()
+            .map_err(|error| format!("{}: {error}", text(Text::TerminalWriteFailed)))?;
+        match terminal_event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if let Some(bytes) = encode_key_with_mode(key, CursorKeyMode::Application) {
+                let remote_modes = terminal.remote_modes();
+                if let Some(bytes) = encode_key_with_mode(key, remote_modes.cursor_key) {
                     match escape.input(bytes) {
                         EscapeAction::Hold => {}
+                        EscapeAction::Help => terminal
+                            .write_local_notice(text(Text::LocalCommandHelp).as_bytes())
+                            .map_err(|error| {
+                                format!("{}: {error}", text(Text::TerminalWriteFailed))
+                            })?,
                         EscapeAction::Quit => return Ok(true),
+                        EscapeAction::Suspend => {
+                            suspend_client(terminal)?;
+                            runtime.resume(monotonic_time(started_at));
+                        }
                         EscapeAction::Forward(bytes) => {
+                            let prediction_frame = runtime.prediction_frame_id();
+                            let prediction_action = prediction_action(key, &bytes);
+                            let terminal_context = terminal.prediction_cursor_context();
+                            let prediction_context = PredictionContext {
+                                row: terminal_context.row,
+                                column: terminal_context.column,
+                                columns: terminal_context.columns,
+                                attributes: terminal_context.attributes,
+                                cursor_state: terminal_context.cursor_state,
+                            };
                             queue_input(runtime, bytes.clone())?;
-                            if let Some(prediction) = predictor.offer(InputKind::Key, &bytes) {
+                            if let Some(prediction) = predictor.offer_for_frame_with_context(
+                                prediction_frame,
+                                prediction_action,
+                                Some(&prediction_context),
+                            ) {
                                 terminal.write_overlay_bytes(&prediction).map_err(|error| {
                                     format!("{}: {error}", text(Text::TerminalWriteFailed))
                                 })?;
@@ -347,28 +373,44 @@ fn drain_terminal(
             }
             Event::Paste(contents) => {
                 flush_escape(runtime, escape)?;
-                let bytes = encode_paste(&contents);
-                let _ = predictor.offer(InputKind::Paste, &bytes);
+                let bytes =
+                    encode_paste_with_mode(&contents, terminal.remote_modes().bracketed_paste);
+                let prediction_frame = runtime.prediction_frame_id();
                 queue_input(runtime, bytes)?;
+                let _ = predictor.offer_for_frame(prediction_frame, PredictionAction::Barrier);
             }
             Event::Mouse(mouse) => {
                 flush_escape(runtime, escape)?;
-                if let Some(bytes) = encode_mouse(mouse) {
-                    let _ = predictor.offer(InputKind::Mouse, &bytes);
+                let remote_modes = terminal.remote_modes();
+                if let Some(bytes) = encode_mouse_with_mode(
+                    mouse,
+                    remote_modes.mouse_tracking,
+                    remote_modes.mouse_encoding,
+                ) {
+                    let prediction_frame = runtime.prediction_frame_id();
                     queue_input(runtime, bytes)?;
+                    let _ = predictor.offer_for_frame(prediction_frame, PredictionAction::Barrier);
                 }
             }
             Event::FocusGained => {
                 flush_escape(runtime, escape)?;
-                let bytes = encode_focus(true);
-                let _ = predictor.offer(InputKind::Focus, &bytes);
-                queue_input(runtime, bytes)?;
+                if let Some(bytes) =
+                    encode_focus_with_mode(true, terminal.remote_modes().focus_reporting)
+                {
+                    let prediction_frame = runtime.prediction_frame_id();
+                    queue_input(runtime, bytes)?;
+                    let _ = predictor.offer_for_frame(prediction_frame, PredictionAction::Barrier);
+                }
             }
             Event::FocusLost => {
                 flush_escape(runtime, escape)?;
-                let bytes = encode_focus(false);
-                let _ = predictor.offer(InputKind::Focus, &bytes);
-                queue_input(runtime, bytes)?;
+                if let Some(bytes) =
+                    encode_focus_with_mode(false, terminal.remote_modes().focus_reporting)
+                {
+                    let prediction_frame = runtime.prediction_frame_id();
+                    queue_input(runtime, bytes)?;
+                    let _ = predictor.offer_for_frame(prediction_frame, PredictionAction::Barrier);
+                }
             }
             Event::Resize(columns, rows) => {
                 flush_escape(runtime, escape)?;
@@ -396,11 +438,50 @@ fn queue_input(runtime: &mut SessionRuntime, bytes: Vec<u8>) -> Result<(), Strin
     runtime.queue_input(bytes).map_err(format_runtime_error)
 }
 
+#[cfg(unix)]
+fn suspend_client(terminal: &mut TerminalGuard) -> Result<(), String> {
+    terminal
+        .leave_for_suspend()
+        .map_err(|error| format!("{}: {error}", text(Text::TerminalSetupFailed)))?;
+    let suspend_result = signal_hook::low_level::raise(signal_hook::consts::SIGTSTP)
+        .map_err(|error| format!("{}: {error}", text(Text::SignalSetupFailed)));
+    let resume_result = terminal
+        .resume_after_suspend()
+        .map_err(|error| format!("{}: {error}", text(Text::TerminalSetupFailed)));
+    suspend_result.and(resume_result)
+}
+
+#[cfg(windows)]
+fn suspend_client(terminal: &mut TerminalGuard) -> Result<(), String> {
+    terminal
+        .write_local_notice(text(Text::SuspendUnsupported).as_bytes())
+        .map_err(|error| format!("{}: {error}", text(Text::TerminalWriteFailed)))
+}
+
+fn prediction_action(key: crossterm::event::KeyEvent, forwarded: &[u8]) -> PredictionAction {
+    if !key
+        .modifiers
+        .intersects(crossterm::event::KeyModifiers::ALT | crossterm::event::KeyModifiers::CONTROL)
+    {
+        match key.code {
+            crossterm::event::KeyCode::Char(_) if forwarded.len() == 1 => {
+                return PredictionAction::PrintableAscii(forwarded[0]);
+            }
+            crossterm::event::KeyCode::Backspace => return PredictionAction::Backspace,
+            crossterm::event::KeyCode::Left => return PredictionAction::Left,
+            crossterm::event::KeyCode::Right => return PredictionAction::Right,
+            _ => {}
+        }
+    }
+    PredictionAction::Barrier
+}
+
 fn apply_actions(
     socket: &UdpSocket,
     terminal: &mut TerminalGuard,
     predictor: &mut PredictionOverlay,
     actions: Vec<SessionAction>,
+    logger: &DiagnosticLogger,
 ) -> Result<(), String> {
     for action in actions {
         match action {
@@ -415,6 +496,13 @@ fn apply_actions(
                     .map_err(|error| format!("{}: {error}", text(Text::TerminalWriteFailed)))?;
             }
             SessionAction::AcknowledgePrediction(value) => predictor.acknowledge(value),
+            SessionAction::RemoteStateAdvanced(_)
+            | SessionAction::ConnectionStateChanged(_)
+            | SessionAction::RoundTripEstimate(_)
+            | SessionAction::SessionLifecycleChanged(_)
+            | SessionAction::UdpBindingChanged(_)
+            | SessionAction::ShutdownComplete(_) => {}
+            SessionAction::Diagnostic(event) => logger.write_event(event),
         }
     }
     Ok(())
@@ -424,10 +512,14 @@ fn reconcile_prediction(
     terminal: &mut TerminalGuard,
     predictor: &mut PredictionOverlay,
 ) -> Result<(), String> {
-    if predictor.reconcile() {
-        terminal
+    match predictor.take_reconciliation() {
+        PredictionReconciliation::None => {}
+        PredictionReconciliation::Local(bytes) => terminal
+            .write_overlay_bytes(&bytes)
+            .map_err(|error| format!("{}: {error}", text(Text::TerminalWriteFailed)))?,
+        PredictionReconciliation::Redraw => terminal
             .redraw_authoritative()
-            .map_err(|error| format!("{}: {error}", text(Text::TerminalWriteFailed)))?;
+            .map_err(|error| format!("{}: {error}", text(Text::TerminalWriteFailed)))?,
     }
     Ok(())
 }
@@ -440,7 +532,7 @@ fn monotonic_time(started_at: Instant) -> MonotonicTime {
 fn format_runtime_error(error: RuntimeError) -> String {
     match error {
         RuntimeError::InputQueueFull => text(Text::InputQueueFull).to_owned(),
-        other => format!("{}: {other:?}", text(Text::ProtocolFailed)),
+        other => format!("{}: {other}", text(Text::ProtocolFailed)),
     }
 }
 
@@ -450,10 +542,7 @@ enum Text {
     ErrorPrefix,
     InputFailed,
     InputQueueFull,
-    InvalidKey,
-    InvalidEscapeKey,
-    InvalidPredictionDisplay,
-    MissingKey,
+    LocalCommandHelp,
     NoAddress,
     ProtocolFailed,
     ReceiveFailed,
@@ -461,11 +550,13 @@ enum Text {
     SendFailed,
     SignalSetupFailed,
     SocketFailed,
+    #[cfg(windows)]
+    SuspendUnsupported,
     TerminalRequired,
     TerminalSetupFailed,
     TerminalSizeFailed,
     TerminalWriteFailed,
-    Usage,
+    UncleanShutdown,
 }
 
 fn text(message: Text) -> &'static str {
@@ -482,14 +573,9 @@ fn text_en(message: Text) -> &'static str {
         Text::ErrorPrefix => "FerrumTTY error",
         Text::InputFailed => "could not read terminal input",
         Text::InputQueueFull => "local input queue limit reached",
-        Text::InvalidKey => "MOSH_KEY is invalid",
-        Text::InvalidEscapeKey => {
-            "MOSH_ESCAPE_KEY must be one literal ASCII character in the range 1-127"
+        Text::LocalCommandHelp => {
+            "\r\nFerrumTTY local commands: . quit, Ctrl-Z suspend, ? help, prefix prefix sends a literal prefix\r\n"
         }
-        Text::InvalidPredictionDisplay => {
-            "MOSH_PREDICTION_DISPLAY must be adaptive, always, or never"
-        }
-        Text::MissingKey => "MOSH_KEY is not set",
         Text::NoAddress => "no address was resolved",
         Text::ProtocolFailed => "protocol operation failed",
         Text::ReceiveFailed => "UDP receive failed",
@@ -497,11 +583,15 @@ fn text_en(message: Text) -> &'static str {
         Text::SendFailed => "UDP send failed",
         Text::SignalSetupFailed => "could not install termination handling",
         Text::SocketFailed => "could not configure UDP socket",
+        #[cfg(windows)]
+        Text::SuspendUnsupported => "\r\nLocal suspend is not supported on this platform.\r\n",
         Text::TerminalRequired => "standard input and output must be terminals",
         Text::TerminalSetupFailed => "could not enter terminal raw mode",
         Text::TerminalSizeFailed => "could not read terminal size",
         Text::TerminalWriteFailed => "could not write terminal output",
-        Text::Usage => "usage",
+        Text::UncleanShutdown => {
+            "\nmosh did not shut down cleanly. Please note that the\nmosh-server process may still be running on the server."
+        }
     }
 }
 
@@ -511,12 +601,9 @@ fn text_zh(message: Text) -> &'static str {
         Text::ErrorPrefix => "FerrumTTY 错误",
         Text::InputFailed => "无法读取终端输入",
         Text::InputQueueFull => "本地输入队列已达到上限",
-        Text::InvalidKey => "MOSH_KEY 无效",
-        Text::InvalidEscapeKey => "MOSH_ESCAPE_KEY 必须是一个取值为 1-127 的字面 ASCII 字符",
-        Text::InvalidPredictionDisplay => {
-            "MOSH_PREDICTION_DISPLAY 必须是 adaptive、always 或 never"
+        Text::LocalCommandHelp => {
+            "\r\nFerrumTTY 本地命令：. 退出，Ctrl-Z 暂停，? 帮助，连续输入两次前缀可发送字面前缀\r\n"
         }
-        Text::MissingKey => "未设置 MOSH_KEY",
         Text::NoAddress => "未解析到可用地址",
         Text::ProtocolFailed => "协议操作失败",
         Text::ReceiveFailed => "UDP 接收失败",
@@ -524,75 +611,47 @@ fn text_zh(message: Text) -> &'static str {
         Text::SendFailed => "UDP 发送失败",
         Text::SignalSetupFailed => "无法安装终止信号处理",
         Text::SocketFailed => "无法配置 UDP 套接字",
+        #[cfg(windows)]
+        Text::SuspendUnsupported => "\r\n当前平台不支持本地暂停。\r\n",
         Text::TerminalRequired => "标准输入和输出必须连接终端",
         Text::TerminalSetupFailed => "无法进入终端原始模式",
         Text::TerminalSizeFailed => "无法读取终端尺寸",
         Text::TerminalWriteFailed => "无法写入终端输出",
-        Text::Usage => "用法",
+        Text::UncleanShutdown => {
+            "\nmosh 未能干净关闭。请注意，服务器上的 mosh-server 进程可能仍在运行。"
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientConfig, Command, DEFAULT_ESCAPE_BYTE, parse_command, parse_escape_key};
-    use ferrumtty_predict::PredictionDisplay;
-    use std::collections::HashMap;
-
-    fn parse(arguments: &[&str], environment: &[(&str, &str)]) -> Result<Command, String> {
-        let arguments = arguments.iter().map(|value| (*value).to_owned());
-        let environment = environment
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-            .collect::<HashMap<_, _>>();
-        parse_command(arguments, |name| environment.get(name).cloned())
-    }
+    use super::prediction_action;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ferrumtty_predict::PredictionAction;
 
     #[test]
-    fn parses_color_mode_without_connection_arguments() {
-        assert_eq!(parse(&["mosh-client", "-c"], &[]), Ok(Command::Colors));
-        assert!(parse(&["mosh-client", "-c", "host", "60001"], &[]).is_err());
-    }
-
-    #[test]
-    fn parses_repeated_verbose_flags_and_environment_boundary() {
+    fn maps_key_semantics_without_parsing_terminal_escape_bytes() {
         assert_eq!(
-            parse(
-                &["mosh-client", "-vv", "-v", "example.test", "60001"],
-                &[
-                    ("MOSH_ESCAPE_KEY", "\u{2}"),
-                    ("MOSH_TITLE_NOPREFIX", "1"),
-                    ("MOSH_PREDICTION_DISPLAY", "always"),
-                    ("MOSH_PREDICTION_OVERWRITE", "yes"),
-                ],
+            prediction_action(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), b"a"),
+            PredictionAction::PrintableAscii(b'a')
+        );
+        assert_eq!(
+            prediction_action(
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                b"\x7f"
             ),
-            Ok(Command::Connect(ClientConfig {
-                endpoint: "example.test:60001".to_owned(),
-                verbosity: 3,
-                escape_byte: 2,
-                title_no_prefix: true,
-                prediction_display: PredictionDisplay::Always,
-                prediction_overwrite: true,
-            }))
+            PredictionAction::Backspace
         );
-        assert!(
-            parse(
-                &["mosh-client", "example.test", "60001"],
-                &[("MOSH_PREDICTION_DISPLAY", "experimental")],
-            )
-            .is_err()
+        assert_eq!(
+            prediction_action(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), b"\x1bOD"),
+            PredictionAction::Left
         );
-    }
-
-    #[test]
-    fn uses_default_escape_and_rejects_invalid_escape_values() {
-        let Ok(Command::Connect(config)) = parse(&["mosh-client", "127.0.0.1", "60001"], &[])
-        else {
-            panic!("connection arguments should parse")
-        };
-        assert_eq!(config.escape_byte, DEFAULT_ESCAPE_BYTE);
-        assert!(parse_escape_key("").is_err());
-        assert!(parse_escape_key("ab").is_err());
-        assert!(parse_escape_key("\u{80}").is_err());
-        assert!(parse_escape_key("\0").is_err());
+        assert_eq!(
+            prediction_action(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+                b"\x1b[1;5D"
+            ),
+            PredictionAction::Barrier
+        );
     }
 }

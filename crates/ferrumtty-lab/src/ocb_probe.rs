@@ -100,8 +100,8 @@ fn report_result(mapping: &str, result: Result<Vec<u8>, ocb3::aead::Error>) -> u
     };
 
     println!(
-        "authenticated nonce_mapping={mapping} plaintext_hex={}",
-        encode_hex(&plaintext)
+        "authenticated nonce_mapping={mapping} plaintext_bytes={}",
+        plaintext.len()
     );
     plaintext.zeroize();
     1
@@ -132,7 +132,8 @@ fn decode_nibble(value: u8) -> Result<u8, String> {
     }
 }
 
-pub(crate) fn encode_hex(bytes: &[u8]) -> String {
+#[cfg(test)]
+fn encode_hex(bytes: &[u8]) -> String {
     const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {

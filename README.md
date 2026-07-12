@@ -96,6 +96,8 @@ placing it in command-line arguments.
 | --- | --- |
 | `Ctrl-^ .` | End the local session |
 | `Ctrl-^ ^` | Send a literal `Ctrl-^` |
+| `Ctrl-^ Ctrl-Z` | Suspend locally on Unix and restore after resume |
+| `Ctrl-^ ?` | Show local command help |
 
 Set `MOSH_ESCAPE_KEY` to one literal ASCII character to choose another local
 command prefix. Printable prefixes follow the conventional newline-prefix
@@ -112,7 +114,7 @@ If the operating system cannot report the viewport, positive `COLUMNS` and
 | `MOSH_ESCAPE_KEY` | One literal ASCII local-command prefix |
 | `MOSH_PREDICTION_DISPLAY` | `adaptive`, `always`, or `never` |
 | `MOSH_PREDICTION_OVERWRITE=yes` | Overwrite instead of insert predicted cells |
-| `MOSH_TITLE_NOPREFIX` | Accepted for standard-client compatibility; FerrumTTY adds no title prefix |
+| `MOSH_TITLE_NOPREFIX` | Disable the default `[mosh] ` remote-title prefix |
 | `MOSH_NO_TERM_INIT=1` | Skip local alternate-screen initialization |
 
 ## What works
@@ -123,14 +125,26 @@ If the operating system cannot report the viewport, positive `COLUMNS` and
 - Stale-state suppression and recoverable indefinite network interruption
 - IPv4 and IPv6 endpoints
 - Client UDP rebinding and suspend/resume recovery
+- Bounded local, peer, and simultaneous SSP shutdown handshakes
 - UTF-8 terminal output and authoritative VT screen tracking
 - Keyboard, function keys, mouse, focus, bracketed paste, and resize
-- Conservative local prediction with full authoritative rollback
+- Conservative local prediction with line-local insert rollback and an
+  authoritative overwrite fallback
 - Terminal restoration after exit, error, panic unwinding, and supported signals
 - English and Simplified Chinese command-line diagnostics
 - Native source checks for macOS, Linux, and Windows targets
 - Static MSVC runtime in Windows release binaries
 - `mosh-client -c`, `-v`, and standard Mosh client environment parsing
+
+`-v`, `-vv`, and `-vvv` enable lifecycle, SSP summary, and aggregate packet
+metadata diagnostics respectively. Diagnostics never include session keys,
+input, terminal output, authenticated plaintext, or datagram contents. Higher
+levels saturate at `-vvv`.
+
+Without terminfo, `-c` is necessarily heuristic. FerrumTTY uses `TERM`,
+`COLORTERM`, and the platform-reported color capability; unknown terminals are
+reported conservatively. POSIX clients require the effective
+`LC_ALL`/`LC_CTYPE`/`LANG` locale to name UTF-8.
 
 On Windows, console control events for Ctrl+C and Ctrl+Break are ignored by the
 local process so their input can be forwarded to the remote session. This path
@@ -146,6 +160,7 @@ The workspace keeps protocol concerns separate from operating-system concerns:
 | `ferrumtty-wire` | Fragment framing, bounded Protobuf decoding, and compression |
 | `ferrumtty-crypto` | Session-key ownership and OCB3 packet envelopes |
 | `ferrumtty-session` | State numbers, acknowledgements, replay handling, and reassembly |
+| `ferrumtty-state` | Cloneable bounded remote terminal states for SSP history reconstruction |
 | `ferrumtty-runtime` | Deterministic timers, queues, retransmission, and host actions |
 | `ferrumtty-terminal` | Terminal lifecycle and input encoding |
 | `ferrumtty-predict` | Non-authoritative local prediction overlay |
@@ -211,7 +226,7 @@ platform build prevents the GitHub Release from being created.
 ## Documentation
 
 - [Compatibility and tested artifact](docs/COMPATIBILITY.md)
-- [Clean-room policy](docs/CLEAN_ROOM.md)
+- [Independent implementation policy](docs/CLEAN_ROOM.md)
 - [Embedding contract](docs/EMBEDDING.md)
 - [Prediction policy](docs/PREDICTION.md)
 - [Project governance and additional licensing](GOVERNANCE.md)
@@ -220,7 +235,7 @@ platform build prevents the GitHub Release from being created.
 ## License and independence
 
 FerrumTTY is licensed under [GPL-3.0-only](LICENSE). It is an independent
-clean-room implementation and is not affiliated with or endorsed by the Mosh
+implementation and is not affiliated with or endorsed by the Mosh
 project. The copyright holder's additional-licensing policy is described in
 [the project governance document](GOVERNANCE.md). Mosh is a registered
 trademark of its respective owner.

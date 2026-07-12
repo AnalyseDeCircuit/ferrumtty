@@ -320,6 +320,15 @@ mod tests {
     }
 
     #[test]
+    fn compressed_update_preserves_shutdown_state_number() {
+        let update = StateUpdate::new(7, u64::MAX, u64::MAX);
+        let compressed = encode_compressed_update(&update).expect("shutdown state must encode");
+        let decoded = decode_compressed_update(&compressed).expect("shutdown state must decode");
+        assert_eq!(decoded.target_state, u64::MAX);
+        assert_eq!(decoded.acknowledged_state, u64::MAX);
+    }
+
+    #[test]
     fn skips_unknown_top_level_field() {
         assert_eq!(validate_fields(&[0x40, 0x01], &[(1, 0)]), Ok(()));
     }
