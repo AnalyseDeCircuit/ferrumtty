@@ -1140,6 +1140,7 @@ pub fn bytes_instruction(value: Vec<u8>) -> Instruction {
         bytes: Some(ByteRun { value }),
         viewport: None,
         marker: None,
+        session_control: None,
     }
 }
 
@@ -1152,6 +1153,7 @@ pub fn viewport_instruction(columns: u16, rows: u16) -> Instruction {
             rows: u64::from(rows),
         }),
         marker: None,
+        session_control: None,
     }
 }
 

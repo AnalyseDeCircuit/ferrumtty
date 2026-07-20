@@ -348,7 +348,7 @@ fn drain_terminal(
                         }
                         EscapeAction::Forward(bytes) => {
                             let prediction_frame = runtime.prediction_frame_id();
-                            let prediction_action = prediction_action(key, &bytes);
+                            let prediction_action = prediction_action(key);
                             let terminal_context = terminal.prediction_cursor_context();
                             let prediction_context = PredictionContext {
                                 row: terminal_context.row,
@@ -458,14 +458,18 @@ fn suspend_client(terminal: &mut TerminalGuard) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", text(Text::TerminalWriteFailed)))
 }
 
-fn prediction_action(key: crossterm::event::KeyEvent, forwarded: &[u8]) -> PredictionAction {
+fn prediction_action(key: crossterm::event::KeyEvent) -> PredictionAction {
     if !key
         .modifiers
         .intersects(crossterm::event::KeyModifiers::ALT | crossterm::event::KeyModifiers::CONTROL)
     {
         match key.code {
-            crossterm::event::KeyCode::Char(_) if forwarded.len() == 1 => {
-                return PredictionAction::PrintableAscii(forwarded[0]);
+            crossterm::event::KeyCode::Char(character) if !character.is_control() => {
+                return if character.is_ascii() {
+                    PredictionAction::PrintableAscii(character as u8)
+                } else {
+                    PredictionAction::PrintableUtf8(character)
+                };
             }
             crossterm::event::KeyCode::Backspace => return PredictionAction::Backspace,
             crossterm::event::KeyCode::Left => return PredictionAction::Left,
@@ -497,8 +501,11 @@ fn apply_actions(
             }
             SessionAction::AcknowledgePrediction(value) => predictor.acknowledge(value),
             SessionAction::RemoteStateAdvanced(_)
+            | SessionAction::ResizeTerminal { .. }
             | SessionAction::ConnectionStateChanged(_)
             | SessionAction::RoundTripEstimate(_)
+            | SessionAction::CapabilitiesChanged(_)
+            | SessionAction::RemoteSessionControl { .. }
             | SessionAction::SessionLifecycleChanged(_)
             | SessionAction::UdpBindingChanged(_)
             | SessionAction::ShutdownComplete(_) => {}
@@ -632,25 +639,23 @@ mod tests {
     #[test]
     fn maps_key_semantics_without_parsing_terminal_escape_bytes() {
         assert_eq!(
-            prediction_action(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), b"a"),
+            prediction_action(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
             PredictionAction::PrintableAscii(b'a')
         );
         assert_eq!(
-            prediction_action(
-                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
-                b"\x7f"
-            ),
+            prediction_action(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE)),
+            PredictionAction::PrintableUtf8('é')
+        );
+        assert_eq!(
+            prediction_action(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
             PredictionAction::Backspace
         );
         assert_eq!(
-            prediction_action(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), b"\x1bOD"),
+            prediction_action(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
             PredictionAction::Left
         );
         assert_eq!(
-            prediction_action(
-                KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
-                b"\x1b[1;5D"
-            ),
+            prediction_action(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)),
             PredictionAction::Barrier
         );
     }

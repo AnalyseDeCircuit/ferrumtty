@@ -22,6 +22,20 @@ pub enum PredictionDisplay {
     Never,
 }
 
+fn single_printable_action(bytes: &[u8]) -> Option<PredictionAction> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut characters = text.chars();
+    let character = characters.next()?;
+    if characters.next().is_some() || character.is_control() {
+        return None;
+    }
+    if character.is_ascii() {
+        Some(PredictionAction::PrintableAscii(character as u8))
+    } else {
+        Some(PredictionAction::PrintableUtf8(character))
+    }
+}
+
 /// Identifies input provenance so uncertain multi-byte actions stay
 /// ineligible even when their bytes contain printable characters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +51,7 @@ pub enum InputKind {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum PredictionAction {
     PrintableAscii(u8),
+    PrintableUtf8(char),
     Backspace,
     Left,
     Right,
@@ -47,6 +62,7 @@ impl fmt::Debug for PredictionAction {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PrintableAscii(_) => formatter.write_str("PrintableAscii([REDACTED])"),
+            Self::PrintableUtf8(_) => formatter.write_str("PrintableUtf8([REDACTED])"),
             Self::Backspace => formatter.write_str("Backspace"),
             Self::Left => formatter.write_str("Left"),
             Self::Right => formatter.write_str("Right"),
@@ -170,12 +186,11 @@ impl PredictionOverlay {
             Some(highest) => highest.checked_add(1)?,
             None => 0,
         };
-        let action =
-            if kind == InputKind::Key && bytes.len() == 1 && matches!(bytes[0], b' '..=b'~') {
-                PredictionAction::PrintableAscii(bytes[0])
-            } else {
-                PredictionAction::Barrier
-            };
+        let action = if kind == InputKind::Key {
+            single_printable_action(bytes).unwrap_or(PredictionAction::Barrier)
+        } else {
+            PredictionAction::Barrier
+        };
         self.offer_for_frame(frame_id, action)
     }
 
@@ -230,12 +245,20 @@ impl PredictionOverlay {
         }
         let output = match action {
             PredictionAction::PrintableAscii(byte) if byte.is_ascii_graphic() || byte == b' ' => {
-                self.predict_printable(frame_id, byte, context)
+                self.predict_printable(frame_id, &[byte], context)
+            }
+            PredictionAction::PrintableUtf8(character) if !character.is_control() => {
+                let mut encoded = [0; 4];
+                self.predict_printable(
+                    frame_id,
+                    character.encode_utf8(&mut encoded).as_bytes(),
+                    context,
+                )
             }
             PredictionAction::Backspace => self.predict_backspace(),
             PredictionAction::Left => self.predict_left(),
             PredictionAction::Right => self.predict_right(),
-            PredictionAction::PrintableAscii(_) => {
+            PredictionAction::PrintableAscii(_) | PredictionAction::PrintableUtf8(_) => {
                 self.invalidate_span();
                 None
             }
@@ -352,7 +375,7 @@ impl PredictionOverlay {
     fn predict_printable(
         &mut self,
         frame_id: u64,
-        byte: u8,
+        bytes: &[u8],
         context: Option<&PredictionContext>,
     ) -> Option<Vec<u8>> {
         if self.cursor_offset != self.predicted_ascii.len() {
@@ -384,7 +407,7 @@ impl PredictionOverlay {
             output.extend_from_slice(INSERT_CHARACTER);
         }
         output.extend_from_slice(UNDERLINE_RENDITION);
-        output.push(byte);
+        output.extend_from_slice(bytes);
         if let Some(context) = context {
             output.extend_from_slice(&context.attributes);
         } else {
@@ -489,13 +512,20 @@ mod tests {
     }
 
     #[test]
-    fn predicts_only_single_printable_ascii_keys() {
+    fn predicts_single_printable_utf8_keys() {
         let mut overlay = PredictionOverlay::new(super::PredictionDisplay::Always, true);
         assert_eq!(
             overlay.offer(InputKind::Key, b"a"),
             Some(b"\x1b[4ma\x1b[24m".to_vec())
         );
-        assert!(overlay.offer(InputKind::Key, "界".as_bytes()).is_none());
+        assert_eq!(
+            overlay.offer(InputKind::Key, "é".as_bytes()),
+            Some(b"\x1b[4m\xc3\xa9\x1b[24m".to_vec())
+        );
+        assert_eq!(
+            overlay.offer(InputKind::Key, "界".as_bytes()),
+            Some("\x1b[4m界\x1b[24m".as_bytes().to_vec())
+        );
         assert!(overlay.offer(InputKind::Key, b"\r").is_none());
         assert!(overlay.offer(InputKind::Paste, b"b").is_none());
         assert!(overlay.offer(InputKind::Mouse, b"c").is_none());

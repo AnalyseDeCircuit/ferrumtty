@@ -4,20 +4,23 @@
 
 use ferrumtty_crypto::SessionKey;
 use ferrumtty_session::{ClientProtocol, SessionError};
-use ferrumtty_wire::{ByteRun, Instruction, InstructionBatch, MessageError, ViewportSize};
+use ferrumtty_wire::{
+    ByteRun, Instruction, InstructionBatch, MessageError, SESSION_CONTROL_CAPABILITY,
+    SessionControl, ViewportSize,
+};
 use std::collections::VecDeque;
 use std::fmt;
 
-const INITIAL_RETRANSMIT_MILLISECONDS: u64 = 250;
-const MAXIMUM_RETRANSMIT_MILLISECONDS: u64 = 2_000;
-const HEARTBEAT_MILLISECONDS: u64 = 3_000;
+const INITIAL_RETRANSMIT_MILLISECONDS: u64 = 1_000;
+const MINIMUM_RETRANSMIT_MILLISECONDS: u64 = 250;
+const MAXIMUM_RETRANSMIT_MILLISECONDS: u64 = 10_000;
 const SERVER_UNRESPONSIVE_MILLISECONDS: u64 = 30_000;
 const MAXIMUM_QUEUED_INPUT_BYTES: usize = 1024 * 1024;
 const SHUTDOWN_RETRY_LIMIT: u8 = 16;
 const SHUTDOWN_TIMEOUT_MILLISECONDS: u64 = 10_000;
 
 /// Version of the host-facing runtime contract documented by this crate.
-pub const EMBEDDING_API_VERSION: u16 = 4;
+pub const EMBEDDING_API_VERSION: u16 = 5;
 
 /// A monotonic millisecond value supplied by the embedding host.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -44,10 +47,19 @@ impl MonotonicTime {
 pub enum SessionAction {
     SendDatagram(Vec<u8>),
     WriteTerminal(Vec<u8>),
+    ResizeTerminal {
+        columns: u16,
+        rows: u16,
+    },
     AcknowledgePrediction(u64),
     RemoteStateAdvanced(u64),
     ConnectionStateChanged(ConnectionState),
     RoundTripEstimate(u16),
+    CapabilitiesChanged(Vec<u8>),
+    RemoteSessionControl {
+        kind: u32,
+        payload: Vec<u8>,
+    },
     SessionLifecycleChanged(SessionLifecycle),
     ShutdownComplete(ShutdownOutcome),
     UdpBindingChanged(u64),
@@ -66,6 +78,11 @@ impl fmt::Debug for SessionAction {
                 .debug_struct("WriteTerminal")
                 .field("bytes", &bytes.len())
                 .finish(),
+            Self::ResizeTerminal { columns, rows } => formatter
+                .debug_struct("ResizeTerminal")
+                .field("columns", columns)
+                .field("rows", rows)
+                .finish(),
             Self::AcknowledgePrediction(value) => formatter
                 .debug_tuple("AcknowledgePrediction")
                 .field(value)
@@ -81,6 +98,15 @@ impl fmt::Debug for SessionAction {
             Self::RoundTripEstimate(value) => formatter
                 .debug_tuple("RoundTripEstimate")
                 .field(value)
+                .finish(),
+            Self::CapabilitiesChanged(value) => formatter
+                .debug_struct("CapabilitiesChanged")
+                .field("bytes", &value.len())
+                .finish(),
+            Self::RemoteSessionControl { kind, payload } => formatter
+                .debug_struct("RemoteSessionControl")
+                .field("kind", kind)
+                .field("payload_bytes", &payload.len())
                 .finish(),
             Self::SessionLifecycleChanged(value) => formatter
                 .debug_tuple("SessionLifecycleChanged")
@@ -198,11 +224,13 @@ pub enum ConnectionState {
 pub struct SessionRuntime {
     protocol: ClientProtocol,
     queued_instructions: VecDeque<Instruction>,
-    pending_resize: Option<ViewportSize>,
     queued_input_bytes: usize,
     last_send: Option<MonotonicTime>,
     last_receive: MonotonicTime,
     retransmit_milliseconds: u64,
+    smoothed_round_trip_milliseconds: Option<u64>,
+    round_trip_variation_milliseconds: u64,
+    association: AssociationState,
     acknowledgement_due: bool,
     received_server_state: bool,
     round_trip_milliseconds: Option<u16>,
@@ -224,17 +252,25 @@ enum ShutdownState {
     Complete(ShutdownOutcome),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AssociationState {
+    Due,
+    Sent,
+}
+
 impl SessionRuntime {
     #[must_use]
     pub fn new(key: SessionKey, now: MonotonicTime) -> Self {
         Self {
             protocol: ClientProtocol::new(key),
             queued_instructions: VecDeque::new(),
-            pending_resize: None,
             queued_input_bytes: 0,
             last_send: None,
             last_receive: now,
             retransmit_milliseconds: INITIAL_RETRANSMIT_MILLISECONDS,
+            smoothed_round_trip_milliseconds: None,
+            round_trip_variation_milliseconds: 0,
+            association: AssociationState::Due,
             acknowledgement_due: false,
             received_server_state: false,
             round_trip_milliseconds: None,
@@ -283,6 +319,7 @@ impl SessionRuntime {
             bytes: Some(ByteRun { value: bytes }),
             viewport: None,
             marker: None,
+            session_control: None,
         });
         Ok(())
     }
@@ -292,10 +329,78 @@ impl SessionRuntime {
             return;
         }
         self.protocol.set_initial_remote_viewport(columns, rows);
-        self.pending_resize = Some(ViewportSize {
+        let viewport = ViewportSize {
             columns: u64::from(columns),
             rows: u64::from(rows),
+        };
+        // Only consecutive resize events are coalesced so input ordering stays intact.
+        let previous_is_resize = self.queued_instructions.back().is_some_and(|last| {
+            last.bytes.is_none()
+                && last.marker.is_none()
+                && last.session_control.is_none()
+                && last.viewport.is_some()
         });
+        if previous_is_resize {
+            if let Some(last) = self.queued_instructions.back_mut() {
+                last.viewport = Some(viewport);
+            }
+        } else {
+            self.queued_instructions.push_back(Instruction {
+                bytes: None,
+                viewport: Some(viewport),
+                marker: None,
+                session_control: None,
+            });
+        }
+    }
+
+    /// Sets capability bytes advertised on subsequent protocol updates.
+    pub fn set_local_capabilities(&mut self, capabilities: Vec<u8>) {
+        self.protocol.set_local_capabilities(capabilities);
+    }
+
+    /// Returns the latest non-empty capability advertisement received from the peer.
+    #[must_use]
+    pub fn remote_capabilities(&self) -> &[u8] {
+        self.protocol.remote_capabilities()
+    }
+
+    /// Reports whether a capability bit is present in both peers' first capability byte.
+    #[must_use]
+    pub fn has_negotiated_capability(&self, capability: u8) -> bool {
+        self.protocol.has_negotiated_capability(capability)
+    }
+
+    /// Queues a mosh-go session-control extension after capability negotiation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime cannot accept input or the peer did not
+    /// negotiate the session-control capability.
+    pub fn queue_session_control(
+        &mut self,
+        kind: u32,
+        payload: Vec<u8>,
+    ) -> Result<(), RuntimeError> {
+        self.ensure_accepting_input()?;
+        if !self.has_negotiated_capability(SESSION_CONTROL_CAPABILITY) {
+            return Err(RuntimeError::CapabilityNotNegotiated);
+        }
+        let new_size = self
+            .queued_input_bytes
+            .checked_add(payload.len())
+            .ok_or(RuntimeError::InputQueueFull)?;
+        if new_size > MAXIMUM_QUEUED_INPUT_BYTES {
+            return Err(RuntimeError::InputQueueFull);
+        }
+        self.queued_input_bytes = new_size;
+        self.queued_instructions.push_back(Instruction {
+            bytes: None,
+            viewport: None,
+            marker: None,
+            session_control: Some(SessionControl { kind, payload }),
+        });
+        Ok(())
     }
 
     /// Pauses timers and rejects new host input until `resume` is called.
@@ -319,7 +424,6 @@ impl SessionRuntime {
         }
         self.lifecycle = SessionLifecycle::Cancelled;
         self.queued_instructions.clear();
-        self.pending_resize = None;
         self.queued_input_bytes = 0;
         lifecycle_actions(SessionLifecycle::Cancelled)
     }
@@ -353,6 +457,7 @@ impl SessionRuntime {
             return Vec::new();
         }
         self.udp_binding_generation = self.udp_binding_generation.saturating_add(1);
+        self.last_send = None;
         vec![
             SessionAction::UdpBindingChanged(self.udp_binding_generation),
             SessionAction::Diagnostic(DiagnosticEvent::UdpBindingChanged {
@@ -388,8 +493,8 @@ impl SessionRuntime {
         }
         self.lifecycle = SessionLifecycle::Running;
         self.last_receive = now;
-        self.last_send = self.protocol.has_pending_update().then_some(now);
-        self.retransmit_milliseconds = INITIAL_RETRANSMIT_MILLISECONDS;
+        // A resumed or rebound transport should probe immediately with its existing SSP state.
+        self.last_send = None;
     }
 
     /// Accepts an authenticated server datagram and returns terminal effects.
@@ -404,12 +509,18 @@ impl SessionRuntime {
         now: MonotonicTime,
     ) -> Result<Vec<SessionAction>, RuntimeError> {
         self.ensure_running()?;
-        let state = self
+        let previous_capabilities = self.protocol.remote_capabilities().to_vec();
+        let receipt = self
             .protocol
-            .ingest(packet)
+            .ingest_packet(packet)
             .map_err(RuntimeError::Session)?;
         self.last_receive = now;
         let mut actions = Vec::new();
+        if self.protocol.remote_capabilities() != previous_capabilities {
+            actions.push(SessionAction::CapabilitiesChanged(
+                self.protocol.remote_capabilities().to_vec(),
+            ));
+        }
         if self.connection_state != ConnectionState::Connected {
             self.connection_state = ConnectionState::Connected;
             actions.push(SessionAction::ConnectionStateChanged(
@@ -421,22 +532,16 @@ impl SessionRuntime {
                 },
             ));
         }
-        let Some(state) = state else {
-            return Ok(actions);
-        };
-        if state.echoed_timestamp != u16::MAX {
-            let elapsed = timestamp(now).wrapping_sub(state.echoed_timestamp);
-            if i16::try_from(elapsed).is_ok() && self.round_trip_milliseconds != Some(elapsed) {
-                self.round_trip_milliseconds = Some(elapsed);
-                actions.push(SessionAction::RoundTripEstimate(elapsed));
-                actions.push(SessionAction::Diagnostic(
-                    DiagnosticEvent::RoundTripUpdated {
-                        milliseconds: elapsed,
-                    },
-                ));
+        if receipt.echoed_timestamp != u16::MAX {
+            let elapsed = timestamp(now).wrapping_sub(receipt.echoed_timestamp);
+            if elapsed <= 30_000 {
+                actions.extend(self.record_round_trip_sample(elapsed));
             }
         }
-        self.acknowledgement_due = true;
+        let Some(state) = receipt.state else {
+            return Ok(actions);
+        };
+        self.acknowledgement_due |= state.advances_remote_state;
         self.received_server_state = true;
         if state.update.target_state == u64::MAX {
             self.peer_shutdown_acknowledgement_due = true;
@@ -474,13 +579,41 @@ impl SessionRuntime {
                     if let Some(bytes) = instruction.bytes {
                         actions.push(SessionAction::WriteTerminal(bytes.value));
                     }
+                    if let Some(viewport) = instruction.viewport {
+                        let dimensions = (
+                            u16::try_from(viewport.columns),
+                            u16::try_from(viewport.rows),
+                        );
+                        if let (Ok(columns), Ok(rows)) = dimensions {
+                            actions.push(SessionAction::ResizeTerminal { columns, rows });
+                        }
+                    }
                     if let Some(marker) = instruction.marker {
                         actions.push(SessionAction::AcknowledgePrediction(marker.value));
+                    }
+                    if let Some(control) = instruction.session_control {
+                        actions.push(SessionAction::RemoteSessionControl {
+                            kind: control.kind,
+                            payload: control.payload,
+                        });
                     }
                     actions
                 }),
         );
         Ok(actions)
+    }
+
+    /// Processes a datagram with mosh-go's best-effort receive semantics.
+    ///
+    /// Authentication, replay, framing, decompression, and message failures
+    /// are treated as a dropped datagram and produce no host actions.
+    #[must_use]
+    pub fn receive_datagram_lossy(
+        &mut self,
+        packet: &[u8],
+        now: MonotonicTime,
+    ) -> Vec<SessionAction> {
+        self.receive_datagram(packet, now).unwrap_or_default()
     }
 
     /// Advances timers and returns datagrams that should be sent now.
@@ -495,27 +628,40 @@ impl SessionRuntime {
         if matches!(self.shutdown, ShutdownState::Complete(_)) {
             return Ok(Vec::new());
         }
+        let mut actions = Vec::new();
+        if self.association == AssociationState::Due {
+            let packets = self
+                .protocol
+                .build_association(timestamp(now))
+                .map_err(RuntimeError::Session)?;
+            let diagnostic = fresh_update_diagnostic(0, &packets, 0, 0);
+            self.association = AssociationState::Sent;
+            self.last_send = Some(now);
+            actions.extend(send_actions(packets));
+            actions.push(SessionAction::Diagnostic(diagnostic));
+        }
         if self.protocol.local_shutdown_acknowledged() && !self.peer_shutdown_acknowledgement_due {
             return Ok(self.complete_shutdown(ShutdownOutcome::Acknowledged));
         }
         if !self.peer_shutdown_acknowledgement_due && self.shutdown_timed_out(now) {
             return Ok(self.complete_shutdown(ShutdownOutcome::TimedOut));
         }
-        let mut actions = self
-            .connection_state_action(now)
-            .into_iter()
-            .flat_map(|state| {
-                [
-                    SessionAction::ConnectionStateChanged(state),
-                    SessionAction::Diagnostic(DiagnosticEvent::ConnectionStateChanged { state }),
-                ]
-            })
-            .collect::<Vec<_>>();
-        let has_queued_state =
-            !self.queued_instructions.is_empty() || self.pending_resize.is_some();
+        actions.extend(
+            self.connection_state_action(now)
+                .into_iter()
+                .flat_map(|state| {
+                    [
+                        SessionAction::ConnectionStateChanged(state),
+                        SessionAction::Diagnostic(DiagnosticEvent::ConnectionStateChanged {
+                            state,
+                        }),
+                    ]
+                }),
+        );
+        let has_queued_state = !self.queued_instructions.is_empty();
         let local_shutdown_unsent = matches!(self.shutdown, ShutdownState::LocalRequested { .. })
             && !self.protocol.local_shutdown_sent();
-        if has_queued_state || local_shutdown_unsent {
+        if (has_queued_state || local_shutdown_unsent) && !self.protocol.has_pending_update() {
             let (packets, diagnostic) = self.build_queued_update(now)?;
             actions.extend(send_actions(packets));
             actions.push(SessionAction::Diagnostic(diagnostic));
@@ -525,11 +671,12 @@ impl SessionRuntime {
         }
 
         if self.protocol.has_pending_update() {
-            let last_send = self.last_send.unwrap_or(now);
-            if !self.acknowledgement_due
-                && now.elapsed_since(last_send) < self.retransmit_milliseconds
-            {
-                return Ok(actions);
+            if !self.acknowledgement_due {
+                if let Some(last_send) = self.last_send {
+                    if now.elapsed_since(last_send) < self.retransmit_milliseconds {
+                        return Ok(actions);
+                    }
+                }
             }
             let packets = self
                 .protocol
@@ -541,10 +688,6 @@ impl SessionRuntime {
                 self.retransmit_milliseconds,
             );
             self.last_send = Some(now);
-            self.retransmit_milliseconds = self
-                .retransmit_milliseconds
-                .saturating_mul(2)
-                .min(MAXIMUM_RETRANSMIT_MILLISECONDS);
             self.acknowledgement_due = false;
             actions.extend(send_actions(packets));
             actions.push(SessionAction::Diagnostic(diagnostic));
@@ -555,11 +698,18 @@ impl SessionRuntime {
 
         let heartbeat_due = self
             .last_send
-            .is_none_or(|last_send| now.elapsed_since(last_send) >= HEARTBEAT_MILLISECONDS);
+            .is_none_or(|last_send| now.elapsed_since(last_send) >= self.retransmit_milliseconds);
         if !self.acknowledgement_due && !heartbeat_due {
             return Ok(actions);
         }
-        let (packets, diagnostic) = self.build_queued_update(now)?;
+        let packets = self
+            .protocol
+            .build_acknowledgement(timestamp(now))
+            .map_err(RuntimeError::Session)?;
+        let diagnostic =
+            fresh_update_diagnostic(self.protocol.latest_local_state(), &packets, 0, 0);
+        self.last_send = Some(now);
+        self.acknowledgement_due = false;
         actions.extend(send_actions(packets));
         actions.push(SessionAction::Diagnostic(diagnostic));
         self.complete_peer_shutdown_after_ack(&mut actions);
@@ -580,16 +730,8 @@ impl SessionRuntime {
             self.protocol.next_local_state()
         };
         let input_bytes = self.queued_input_bytes;
-        let viewport = self.pending_resize.take().map(|viewport| Instruction {
-            bytes: None,
-            viewport: Some(viewport),
-            marker: None,
-        });
         let instructions = InstructionBatch {
-            instructions: viewport
-                .into_iter()
-                .chain(self.queued_instructions.drain(..))
-                .collect(),
+            instructions: self.queued_instructions.drain(..).collect(),
         };
         let instruction_count = instructions.instructions.len();
         self.queued_input_bytes = 0;
@@ -612,7 +754,6 @@ impl SessionRuntime {
                 .map_err(RuntimeError::Session)?
         };
         self.last_send = Some(now);
-        self.retransmit_milliseconds = INITIAL_RETRANSMIT_MILLISECONDS;
         let diagnostic =
             fresh_update_diagnostic(state_id, &packets, instruction_count, input_bytes);
         Ok((packets, diagnostic))
@@ -625,11 +766,13 @@ impl SessionRuntime {
         {
             return u64::MAX;
         }
-        let protocol_wait = if self.acknowledgement_due
-            || !self.queued_instructions.is_empty()
-            || self.pending_resize.is_some()
+        let can_send_queued = !self.protocol.has_pending_update();
+        let protocol_wait = if self.association == AssociationState::Due
+            || self.acknowledgement_due
+            || (can_send_queued && !self.queued_instructions.is_empty())
             || (matches!(self.shutdown, ShutdownState::LocalRequested { .. })
-                && !self.protocol.local_shutdown_sent())
+                && !self.protocol.local_shutdown_sent()
+                && can_send_queued)
         {
             0
         } else if self.protocol.has_pending_update() {
@@ -639,7 +782,8 @@ impl SessionRuntime {
             })
         } else {
             self.last_send.map_or(0, |last_send| {
-                HEARTBEAT_MILLISECONDS.saturating_sub(now.elapsed_since(last_send))
+                self.retransmit_milliseconds
+                    .saturating_sub(now.elapsed_since(last_send))
             })
         };
         match self.shutdown {
@@ -719,6 +863,47 @@ impl SessionRuntime {
             return Some(ConnectionState::Interrupted);
         }
         None
+    }
+
+    fn update_retransmit_timeout(&mut self, sample_milliseconds: u64) {
+        if let Some(smoothed) = self.smoothed_round_trip_milliseconds {
+            let difference = smoothed.abs_diff(sample_milliseconds);
+            self.round_trip_variation_milliseconds = self
+                .round_trip_variation_milliseconds
+                .saturating_mul(3)
+                .saturating_add(difference)
+                / 4;
+            self.smoothed_round_trip_milliseconds = Some(
+                smoothed
+                    .saturating_mul(7)
+                    .saturating_add(sample_milliseconds)
+                    / 8,
+            );
+        } else {
+            self.smoothed_round_trip_milliseconds = Some(sample_milliseconds);
+            self.round_trip_variation_milliseconds = sample_milliseconds / 2;
+        }
+        let smoothed = self
+            .smoothed_round_trip_milliseconds
+            .unwrap_or(sample_milliseconds);
+        self.retransmit_milliseconds = smoothed
+            .saturating_add(self.round_trip_variation_milliseconds.saturating_mul(4))
+            .clamp(
+                MINIMUM_RETRANSMIT_MILLISECONDS,
+                MAXIMUM_RETRANSMIT_MILLISECONDS,
+            );
+    }
+
+    fn record_round_trip_sample(&mut self, milliseconds: u16) -> Vec<SessionAction> {
+        self.update_retransmit_timeout(u64::from(milliseconds));
+        if self.round_trip_milliseconds == Some(milliseconds) {
+            return Vec::new();
+        }
+        self.round_trip_milliseconds = Some(milliseconds);
+        vec![
+            SessionAction::RoundTripEstimate(milliseconds),
+            SessionAction::Diagnostic(DiagnosticEvent::RoundTripUpdated { milliseconds }),
+        ]
     }
 
     fn ensure_running(&self) -> Result<(), RuntimeError> {
@@ -831,6 +1016,7 @@ fn send_actions(packets: Vec<Vec<u8>>) -> Vec<SessionAction> {
 #[derive(Debug)]
 pub enum RuntimeError {
     InputQueueFull,
+    CapabilityNotNegotiated,
     SessionPaused,
     SessionCancelled,
     ShutdownInProgress,
@@ -842,6 +1028,9 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InputQueueFull => formatter.write_str("terminal input queue is full"),
+            Self::CapabilityNotNegotiated => {
+                formatter.write_str("session-control capability was not negotiated")
+            }
             Self::SessionPaused => formatter.write_str("session is paused"),
             Self::SessionCancelled => formatter.write_str("session is cancelled"),
             Self::ShutdownInProgress => formatter.write_str("session shutdown is in progress"),
@@ -861,8 +1050,9 @@ mod tests {
     };
     use ferrumtty_crypto::{PeerRole, SecureChannel, SessionKey};
     use ferrumtty_wire::{
-        ByteRun, Fragment, Instruction, InstructionBatch, StateUpdate, ViewportSize,
-        decode_compressed_update, encode_compressed_update,
+        ByteRun, Fragment, Instruction, InstructionBatch, SESSION_CONTROL_CAPABILITY,
+        SessionControl, StateUpdate, ViewportSize, decode_compressed_update,
+        encode_compressed_update,
     };
 
     const SYNTHETIC_KEY: &str = "AAECAwQFBgcICQoLDA0ODw";
@@ -873,18 +1063,18 @@ mod tests {
         assert!(!runtime.has_received_server_state());
         runtime.queue_resize(80, 24);
         let first = runtime.poll(time(0)).expect("initial poll must send");
-        assert_eq!(non_diagnostic_actions(first).len(), 1);
+        assert_eq!(non_diagnostic_actions(first).len(), 2);
         assert!(
             runtime
-                .poll(time(249))
+                .poll(time(999))
                 .expect("early poll must work")
                 .is_empty()
         );
         assert_eq!(
-            non_diagnostic_actions(runtime.poll(time(250)).expect("retry must send")).len(),
+            non_diagnostic_actions(runtime.poll(time(1_000)).expect("retry must send")).len(),
             1
         );
-        assert_eq!(runtime.milliseconds_until_next_poll(time(250)), 500);
+        assert_eq!(runtime.milliseconds_until_next_poll(time(1_000)), 1_000);
 
         let server_packet = server_packet(1, b"ready");
         assert_eq!(
@@ -926,16 +1116,8 @@ mod tests {
         runtime.queue_resize(100, 30);
         runtime.queue_resize(132, 43);
         let actions = runtime.poll(time(0)).expect("resize must send");
-        let SessionAction::SendDatagram(packet) = &actions[0] else {
-            panic!("first action must be a datagram");
-        };
-        let server_channel = SecureChannel::new(PeerRole::Server, key());
-        let plaintext = server_channel
-            .open(packet)
-            .expect("resize packet must authenticate")
-            .plaintext;
-        let fragment = Fragment::parse(&plaintext).expect("resize fragment must parse");
-        let update = decode_compressed_update(&fragment.body).expect("resize state must decode");
+        let mut server_channel = SecureChannel::new(PeerRole::Server, key());
+        let update = decode_sent_update(&actions, &mut server_channel);
         assert_eq!(
             update
                 .decode_instructions()
@@ -950,7 +1132,244 @@ mod tests {
     }
 
     #[test]
-    fn new_input_advances_while_older_states_await_acknowledgement() {
+    fn resize_coalescing_preserves_input_order() {
+        let mut runtime = SessionRuntime::new(key(), time(0));
+        runtime
+            .queue_input(b"a".to_vec())
+            .expect("input must queue");
+        runtime.queue_resize(80, 24);
+        runtime.queue_resize(100, 30);
+        runtime
+            .queue_input(b"b".to_vec())
+            .expect("input must queue");
+        runtime.queue_resize(132, 43);
+
+        let actions = runtime.poll(time(0)).expect("queued state must send");
+        let mut server_channel = SecureChannel::new(PeerRole::Server, key());
+        let instructions = decode_sent_update(&actions, &mut server_channel)
+            .decode_instructions()
+            .expect("instructions must decode")
+            .instructions;
+
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(
+            instructions[0]
+                .bytes
+                .as_ref()
+                .map(|bytes| bytes.value.as_slice()),
+            Some(b"a".as_slice())
+        );
+        assert_eq!(
+            instructions[1].viewport,
+            Some(ViewportSize {
+                columns: 100,
+                rows: 30
+            })
+        );
+        assert_eq!(
+            instructions[2]
+                .bytes
+                .as_ref()
+                .map(|bytes| bytes.value.as_slice()),
+            Some(b"b".as_slice())
+        );
+        assert_eq!(
+            instructions[3].viewport,
+            Some(ViewportSize {
+                columns: 132,
+                rows: 43
+            })
+        );
+    }
+
+    #[test]
+    fn round_trip_samples_drive_mosh_go_retransmit_bounds() {
+        let mut fast = SessionRuntime::new(key(), time(0));
+        fast.update_retransmit_timeout(0);
+        assert_eq!(fast.retransmit_milliseconds, 250);
+
+        let mut typical = SessionRuntime::new(key(), time(0));
+        typical.update_retransmit_timeout(100);
+        assert_eq!(typical.retransmit_milliseconds, 300);
+        typical.update_retransmit_timeout(100);
+        assert_eq!(typical.retransmit_milliseconds, 250);
+
+        let mut slow = SessionRuntime::new(key(), time(0));
+        slow.update_retransmit_timeout(10_000);
+        assert_eq!(slow.retransmit_milliseconds, 10_000);
+    }
+
+    #[test]
+    fn timestamp_only_heartbeat_updates_liveness_and_round_trip_time() {
+        let mut runtime = SessionRuntime::new(key(), time(0));
+        let heartbeat = SecureChannel::new(PeerRole::Server, key())
+            .seal_next(&[0, 77, 0, 10])
+            .expect("heartbeat must seal");
+
+        assert_eq!(
+            non_diagnostic_actions(
+                runtime
+                    .receive_datagram(&heartbeat, time(110))
+                    .expect("heartbeat must authenticate")
+            ),
+            vec![
+                SessionAction::ConnectionStateChanged(ConnectionState::Connected),
+                SessionAction::RoundTripEstimate(100),
+            ]
+        );
+        assert!(!runtime.has_received_server_state());
+        assert!(runtime.is_server_responsive(time(110)));
+
+        let actions = runtime.poll(time(110)).expect("association must send");
+        let packet = actions
+            .iter()
+            .find_map(|action| match action {
+                SessionAction::SendDatagram(packet) => Some(packet),
+                _ => None,
+            })
+            .expect("poll must produce an association datagram");
+        let plaintext = SecureChannel::new(PeerRole::Server, key())
+            .open(packet)
+            .expect("association must authenticate")
+            .plaintext;
+        let fragment = Fragment::parse(&plaintext).expect("association must contain a state");
+        assert_eq!(fragment.header.echoed_timestamp, 77);
+    }
+
+    #[test]
+    fn negotiated_session_control_is_exposed_and_can_be_queued() {
+        let mut runtime = SessionRuntime::new(key(), time(0));
+        runtime.set_local_capabilities(vec![SESSION_CONTROL_CAPABILITY]);
+
+        let mut update = StateUpdate::new(0, 1, 0);
+        update.capabilities = vec![SESSION_CONTROL_CAPABILITY];
+        update.delta = InstructionBatch {
+            instructions: vec![Instruction {
+                bytes: None,
+                viewport: None,
+                marker: None,
+                session_control: Some(SessionControl {
+                    kind: 2,
+                    payload: b"remote".to_vec(),
+                }),
+            }],
+        }
+        .encode_bytes();
+        let packet = encoded_server_update(&update, 1);
+        let inbound = runtime
+            .receive_datagram(&packet, time(1))
+            .expect("extension update must open");
+
+        assert!(runtime.has_negotiated_capability(SESSION_CONTROL_CAPABILITY));
+        assert!(inbound.contains(&SessionAction::CapabilitiesChanged(vec![
+            SESSION_CONTROL_CAPABILITY
+        ])));
+        assert!(inbound.contains(&SessionAction::RemoteSessionControl {
+            kind: 2,
+            payload: b"remote".to_vec(),
+        }));
+
+        runtime
+            .queue_session_control(3, b"local".to_vec())
+            .expect("negotiated control must queue");
+        let outbound = runtime.poll(time(1)).expect("control must send");
+        let mut server_channel = SecureChannel::new(PeerRole::Server, key());
+        let instructions = decode_sent_update(&outbound, &mut server_channel)
+            .decode_instructions()
+            .expect("control must decode")
+            .instructions;
+        assert_eq!(
+            instructions
+                .last()
+                .and_then(|instruction| instruction.session_control.as_ref()),
+            Some(&SessionControl {
+                kind: 3,
+                payload: b"local".to_vec()
+            })
+        );
+    }
+
+    #[test]
+    fn remote_session_control_preserves_instruction_order() {
+        let mut runtime = SessionRuntime::new(key(), time(0));
+        let mut update = StateUpdate::new(0, 1, 0);
+        update.delta = InstructionBatch {
+            instructions: vec![
+                Instruction {
+                    bytes: None,
+                    viewport: None,
+                    marker: None,
+                    session_control: Some(SessionControl {
+                        kind: 2,
+                        payload: b"switch".to_vec(),
+                    }),
+                },
+                Instruction {
+                    bytes: Some(ByteRun {
+                        value: b"after".to_vec(),
+                    }),
+                    viewport: None,
+                    marker: None,
+                    session_control: None,
+                },
+                Instruction {
+                    bytes: None,
+                    viewport: Some(ViewportSize {
+                        columns: 100,
+                        rows: 30,
+                    }),
+                    marker: None,
+                    session_control: None,
+                },
+            ],
+        }
+        .encode_bytes();
+        let packet = encoded_server_update(&update, 1);
+
+        let actions = non_diagnostic_actions(
+            runtime
+                .receive_datagram(&packet, time(1))
+                .expect("ordered update must open"),
+        );
+        let control_index = actions
+            .iter()
+            .position(|action| matches!(action, SessionAction::RemoteSessionControl { .. }))
+            .expect("control action must exist");
+        let output_index = actions
+            .iter()
+            .position(|action| matches!(action, SessionAction::WriteTerminal(_)))
+            .expect("terminal action must exist");
+        let resize_index = actions
+            .iter()
+            .position(|action| matches!(action, SessionAction::ResizeTerminal { .. }))
+            .expect("resize action must exist");
+        assert!(control_index < output_index && output_index < resize_index);
+    }
+
+    #[test]
+    fn duplicate_remote_state_does_not_start_an_acknowledgement_loop() {
+        let mut runtime = SessionRuntime::new(key(), time(0));
+        runtime.poll(time(0)).expect("association must send");
+        let mut server_channel = SecureChannel::new(PeerRole::Server, key());
+        let update = StateUpdate::new(0, 1, 0);
+
+        let first = encoded_server_update_with_channel(&mut server_channel, &update, 1);
+        runtime
+            .receive_datagram(&first, time(10))
+            .expect("first state must open");
+        runtime
+            .poll(time(10))
+            .expect("first state must be acknowledged");
+
+        let duplicate = encoded_server_update_with_channel(&mut server_channel, &update, 2);
+        runtime
+            .receive_datagram(&duplicate, time(11))
+            .expect("duplicate state must open");
+        assert!(runtime.poll(time(11)).expect("poll must work").is_empty());
+    }
+
+    #[test]
+    fn new_input_waits_for_the_single_in_flight_state() {
         let mut runtime = SessionRuntime::new(key(), time(0));
         let mut server_channel = SecureChannel::new(PeerRole::Server, key());
 
@@ -965,25 +1384,41 @@ mod tests {
             .queue_input(b"b".to_vec())
             .expect("input must queue");
         let second = runtime.poll(time(1)).expect("second input must send");
-        let second_update = decode_sent_update(&second, &mut server_channel);
-        assert_eq!(
-            (second_update.base_state, second_update.target_state),
-            (1, 2)
-        );
+        assert!(second.is_empty());
 
-        let retransmitted = runtime.poll(time(251)).expect("latest state must retry");
+        let retransmitted = runtime
+            .poll(time(1_000))
+            .expect("in-flight state must retry");
         let retransmitted_update = decode_sent_update(&retransmitted, &mut server_channel);
         assert_eq!(
             (
                 retransmitted_update.base_state,
                 retransmitted_update.target_state
             ),
-            (0, 2)
+            (0, 1)
         );
         let instructions = retransmitted_update
             .decode_instructions()
             .expect("retransmitted input must decode");
-        assert_eq!(instructions.instructions.len(), 2);
+        assert_eq!(instructions.instructions.len(), 1);
+
+        let acknowledgement = server_state_packet(0, 1, 1);
+        runtime
+            .receive_datagram(&acknowledgement, time(1_001))
+            .expect("acknowledgement must open");
+        let next = runtime
+            .poll(time(1_001))
+            .expect("queued input must send after acknowledgement");
+        let next_update = decode_sent_update(&next, &mut server_channel);
+        assert_eq!((next_update.base_state, next_update.target_state), (1, 2));
+        assert_eq!(
+            next_update
+                .decode_instructions()
+                .expect("next input must decode")
+                .instructions
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -992,17 +1427,16 @@ mod tests {
         runtime.queue_resize(80, 24);
         assert_eq!(
             non_diagnostic_actions(runtime.poll(time(0)).expect("initial state must send")).len(),
-            1
+            2
         );
 
         runtime.resume(time(120_000));
-        assert!(
-            runtime
-                .poll(time(120_000))
-                .expect("resume poll must work")
-                .is_empty()
+        assert_eq!(
+            non_diagnostic_actions(runtime.poll(time(120_000)).expect("resume poll must work"))
+                .len(),
+            1
         );
-        assert_eq!(runtime.milliseconds_until_next_poll(time(120_000)), 250);
+        assert_eq!(runtime.milliseconds_until_next_poll(time(120_000)), 1_000);
     }
 
     #[test]
@@ -1014,6 +1448,7 @@ mod tests {
                 bytes: None,
                 viewport: None,
                 marker: Some(ferrumtty_wire::Marker { value: 17 }),
+                session_control: None,
             },
         );
         assert_eq!(
@@ -1029,6 +1464,31 @@ mod tests {
                 SessionAction::AcknowledgePrediction(17),
             ]
         );
+    }
+
+    #[test]
+    fn authoritative_server_resize_is_exposed_to_the_host() {
+        let mut runtime = SessionRuntime::new(key(), time(0));
+        let packet = server_instruction_packet(
+            0,
+            Instruction {
+                bytes: None,
+                viewport: Some(ViewportSize {
+                    columns: 132,
+                    rows: 43,
+                }),
+                marker: None,
+                session_control: None,
+            },
+        );
+
+        let actions = runtime
+            .receive_datagram(&packet, time(1))
+            .expect("server resize must decode");
+        assert!(actions.contains(&SessionAction::ResizeTerminal {
+            columns: 132,
+            rows: 43,
+        }));
     }
 
     #[test]
@@ -1076,13 +1536,13 @@ mod tests {
                 ..
             })
         )));
-        let retransmission = runtime.poll(time(250)).expect("update must retransmit");
+        let retransmission = runtime.poll(time(1_000)).expect("update must retransmit");
         assert!(retransmission.iter().any(|action| matches!(
             action,
             SessionAction::Diagnostic(DiagnosticEvent::RetransmissionPrepared {
                 state_id: 1,
                 datagram_count: 1,
-                retransmit_delay_milliseconds: 250,
+                retransmit_delay_milliseconds: 1_000,
                 ..
             })
         )));
@@ -1191,7 +1651,7 @@ mod tests {
             Err(RuntimeError::SessionCancelled)
         ));
         runtime.queue_resize(132, 43);
-        assert!(runtime.pending_resize.is_none());
+        assert!(runtime.queued_instructions.is_empty());
         assert!(runtime.notify_udp_rebound().is_empty());
     }
 
@@ -1322,6 +1782,7 @@ mod tests {
                 }),
                 viewport: None,
                 marker: None,
+                session_control: None,
             },
         )
     }
@@ -1344,11 +1805,23 @@ mod tests {
 
     fn server_state_packet(base_state: u64, target_state: u64, acknowledged_state: u64) -> Vec<u8> {
         let update = StateUpdate::new(base_state, target_state, acknowledged_state);
-        let compressed = encode_compressed_update(&update).expect("state must compress");
-        let fragment = Fragment::split(&compressed, 1, 0, target_state)
+        encoded_server_update(&update, target_state)
+    }
+
+    fn encoded_server_update(update: &StateUpdate, fragment_id: u64) -> Vec<u8> {
+        let mut channel = SecureChannel::new(PeerRole::Server, key());
+        encoded_server_update_with_channel(&mut channel, update, fragment_id)
+    }
+
+    fn encoded_server_update_with_channel(
+        channel: &mut SecureChannel,
+        update: &StateUpdate,
+        fragment_id: u64,
+    ) -> Vec<u8> {
+        let compressed = encode_compressed_update(update).expect("state must compress");
+        let fragment = Fragment::split(&compressed, 1, 0, fragment_id)
             .expect("state must fragment")
             .remove(0);
-        let mut channel = SecureChannel::new(PeerRole::Server, key());
         channel
             .seal_next(&fragment.encode())
             .expect("server packet must seal")
@@ -1358,19 +1831,23 @@ mod tests {
         actions: &[SessionAction],
         server_channel: &mut SecureChannel,
     ) -> StateUpdate {
-        let packet = actions
+        actions
             .iter()
-            .find_map(|action| match action {
+            .filter_map(|action| match action {
                 SessionAction::SendDatagram(packet) => Some(packet),
                 _ => None,
             })
-            .expect("actions must contain a datagram");
-        let plaintext = server_channel
-            .open(packet)
-            .expect("client datagram must authenticate")
-            .plaintext;
-        let fragment = Fragment::parse(&plaintext).expect("datagram must contain a fragment");
-        decode_compressed_update(&fragment.body).expect("state update must decode")
+            .map(|packet| {
+                let plaintext = server_channel
+                    .open(packet)
+                    .expect("client datagram must authenticate")
+                    .plaintext;
+                let fragment =
+                    Fragment::parse(&plaintext).expect("datagram must contain a fragment");
+                decode_compressed_update(&fragment.body).expect("state update must decode")
+            })
+            .last()
+            .expect("actions must contain a datagram")
     }
 
     fn key() -> SessionKey {

@@ -28,7 +28,7 @@ Synthetic compatibility checks additionally cover:
 - suppression of a completed server state retransmitted under a fresh packet
   counter;
 - exact acknowledgement matching for retained local states;
-- multiple unacknowledged local states and retransmission from the confirmed
+- one-unacknowledged-state input batching and retransmission from the confirmed
   baseline;
 - retained remote-state reconstruction, `throwaway_num` pruning, and
   suppression of repeated HostBytes when the reconstructed history extends the
@@ -51,6 +51,11 @@ Synthetic compatibility checks additionally cover:
 - content-redacted diagnostics and `Debug` formatting for authenticated
   plaintext, datagrams, fragments, terminal output, and prediction input;
 - continued polling and heartbeat scheduling after prolonged network silence.
+- mosh-go state-zero association, adaptive 250 ms to 10 s retransmission
+  timing from every authenticated packet, timestamp-only heartbeat handling,
+  ordered resize coalescing, 1300-byte peer fragments, acceptance of fragment
+  identifiers independent from SSP state identifiers, and optional
+  capability/session-control extension fields.
 
 The new sender-history, prediction, and dynamic terminal-mode behavior added
 after the recorded live-server run is covered only by these synthetic checks.
@@ -58,10 +63,19 @@ It must not be described as live interoperability validation until the lab is
 run again against an exact server artifact.
 
 Remote terminal histories retain at most 16 MiB of HostBytes and 65,536 parser
-operations per logical branch. A divergent branch uses a screen diff only when
-its differing tails contain reconstructible text and both parsers end at a
-ground boundary. Incomplete UTF-8, incomplete or branch-local control
-sequences, and resize divergence remain conservatively undelivered.
+operations per logical branch. Completed ground-state histories compact to a
+formatted terminal snapshot before reaching that bound. A divergent branch
+uses a screen diff when both parsers end at a ground boundary; incomplete UTF-8
+or control sequences remain conservatively undelivered.
+
+The mosh-go comparison baseline is commit
+`8dca5c67ec8e09f71a4dc8eda9216f2f4ee7ec0f` from 2026-04-05. FerrumTTY keeps
+its bounded replay window, conservative 1214-byte outbound fragmentation,
+structured errors, pause/resume events, and graceful SSP shutdown because
+those are robustness or host-contract extensions. Its receiver accepts the
+larger mosh-go fragment shape. Compatibility here means client-visible
+function and protocol interoperability, not byte-for-byte reproduction of
+every mosh-go implementation choice.
 
 These checks use constructed protocol states and do not constitute a native
 terminal or live-server interoperability test.

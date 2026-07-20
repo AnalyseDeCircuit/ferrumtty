@@ -10,6 +10,15 @@ const PROTOCOL_VERSION: u64 = 2;
 const MAXIMUM_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 const MAXIMUM_DECOMPRESSED_BYTES_U64: u64 = 16 * 1024 * 1024;
 
+/// Capability bit used by mosh-go for its optional session-control extension.
+pub const SESSION_CONTROL_CAPABILITY: u8 = 1;
+pub const SESSION_LIST_REQUEST: u32 = 1;
+pub const SESSION_LIST_RESPONSE: u32 = 2;
+pub const SESSION_SWITCH_REQUEST: u32 = 3;
+pub const SESSION_SWITCHED: u32 = 4;
+pub const SESSION_CREATE_REQUEST: u32 = 5;
+pub const SESSION_CREATED: u32 = 6;
+
 #[derive(Clone, PartialEq, Message)]
 pub struct StateUpdate {
     #[prost(uint64, tag = "1")]
@@ -26,6 +35,8 @@ pub struct StateUpdate {
     pub delta: Vec<u8>,
     #[prost(bytes = "vec", tag = "7")]
     pub padding: Vec<u8>,
+    #[prost(bytes = "vec", tag = "8")]
+    pub capabilities: Vec<u8>,
 }
 
 impl StateUpdate {
@@ -39,6 +50,7 @@ impl StateUpdate {
             discard_before: 0,
             delta: Vec::new(),
             padding: Vec::new(),
+            capabilities: Vec::new(),
         }
     }
 
@@ -75,6 +87,8 @@ pub struct Instruction {
     pub viewport: Option<ViewportSize>,
     #[prost(message, optional, tag = "7")]
     pub marker: Option<Marker>,
+    #[prost(message, optional, tag = "9")]
+    pub session_control: Option<SessionControl>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -95,6 +109,15 @@ pub struct ViewportSize {
 pub struct Marker {
     #[prost(uint64, tag = "8")]
     pub value: u64,
+}
+
+/// Optional mosh-go session-control instruction carried in instruction field 9.
+#[derive(Clone, Eq, PartialEq, Message)]
+pub struct SessionControl {
+    #[prost(uint32, tag = "10")]
+    pub kind: u32,
+    #[prost(bytes = "vec", tag = "11")]
+    pub payload: Vec<u8>,
 }
 
 /// Compresses one validated state update with the observed zlib framing.
@@ -138,7 +161,16 @@ pub fn decode_compressed_update(compressed: &[u8]) -> Result<StateUpdate, Messag
     }
     validate_fields(
         &encoded,
-        &[(1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 2), (7, 2)],
+        &[
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (4, 0),
+            (5, 0),
+            (6, 2),
+            (7, 2),
+            (8, 2),
+        ],
     )?;
     let update =
         StateUpdate::decode(encoded.as_slice()).map_err(|_| MessageError::MalformedProtobuf)?;
@@ -151,12 +183,13 @@ pub fn decode_compressed_update(compressed: &[u8]) -> Result<StateUpdate, Messag
 
 fn validate_instruction_batch(encoded: &[u8]) -> Result<(), MessageError> {
     for instruction in length_delimited_values(encoded, &[(1, 2)])? {
-        validate_fields(instruction, &[(2, 2), (3, 2), (7, 2)])?;
+        validate_fields(instruction, &[(2, 2), (3, 2), (7, 2), (9, 2)])?;
         for (field, value) in length_delimited_fields(instruction)? {
             match field {
                 2 => validate_fields(value, &[(4, 2)])?,
                 3 => validate_fields(value, &[(5, 0), (6, 0)])?,
                 7 => validate_fields(value, &[(8, 0)])?,
+                9 => validate_fields(value, &[(10, 0), (11, 2)])?,
                 _ => {}
             }
         }
@@ -202,6 +235,7 @@ fn length_delimited_fields(mut encoded: &[u8]) -> Result<Vec<(u64, &[u8])>, Mess
         let wire_type = u8::try_from(key & 7).expect("wire type fits u8");
         match wire_type {
             0 => encoded = skip_value(encoded, wire_type)?,
+            1 => encoded = skip_value(encoded, wire_type)?,
             2 => {
                 let (length, length_bytes) = decode_varint(encoded)?;
                 encoded = &encoded[length_bytes..];
@@ -213,6 +247,7 @@ fn length_delimited_fields(mut encoded: &[u8]) -> Result<Vec<(u64, &[u8])>, Mess
                 values.push((field, value));
                 encoded = remainder;
             }
+            5 => encoded = skip_value(encoded, wire_type)?,
             _ => return Err(MessageError::UnsupportedWireType),
         }
     }
@@ -266,8 +301,9 @@ pub enum MessageError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ByteRun, Instruction, InstructionBatch, MessageError, StateUpdate, ViewportSize,
-        decode_compressed_update, encode_compressed_update, validate_fields,
+        ByteRun, Instruction, InstructionBatch, MessageError, SESSION_CONTROL_CAPABILITY,
+        SessionControl, StateUpdate, ViewportSize, decode_compressed_update,
+        encode_compressed_update, validate_fields, validate_instruction_batch,
     };
     use prost::Message;
 
@@ -308,6 +344,7 @@ mod tests {
                 }),
                 viewport: None,
                 marker: None,
+                session_control: None,
             }],
         };
         let mut update = StateUpdate::new(3, 4, 2);
@@ -329,8 +366,48 @@ mod tests {
     }
 
     #[test]
+    fn mosh_go_extensions_round_trip_without_affecting_classic_fields() {
+        let mut update = StateUpdate::new(3, 4, 2);
+        update.capabilities = vec![SESSION_CONTROL_CAPABILITY];
+        update.delta = InstructionBatch {
+            instructions: vec![Instruction {
+                bytes: None,
+                viewport: None,
+                marker: None,
+                session_control: Some(SessionControl {
+                    kind: 3,
+                    payload: b"session-name".to_vec(),
+                }),
+            }],
+        }
+        .encode_bytes();
+
+        let compressed = encode_compressed_update(&update).expect("extensions must encode");
+        let decoded = decode_compressed_update(&compressed).expect("extensions must decode");
+
+        assert_eq!(decoded.capabilities, vec![SESSION_CONTROL_CAPABILITY]);
+        assert_eq!(
+            decoded
+                .decode_instructions()
+                .expect("instructions must decode"),
+            update
+                .decode_instructions()
+                .expect("source instructions must decode")
+        );
+        assert_eq!((decoded.base_state, decoded.target_state), (3, 4));
+    }
+
+    #[test]
     fn skips_unknown_top_level_field() {
         assert_eq!(validate_fields(&[0x40, 0x01], &[(1, 0)]), Ok(()));
+    }
+
+    #[test]
+    fn skips_unknown_fixed_width_instruction_fields() {
+        let encoded = [
+            0x0a, 0x10, 0xa1, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0xad, 0x01, 0, 0, 0, 0,
+        ];
+        assert_eq!(validate_instruction_batch(&encoded), Ok(()));
     }
 
     #[test]

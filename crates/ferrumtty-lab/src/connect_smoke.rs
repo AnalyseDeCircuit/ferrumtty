@@ -70,6 +70,7 @@ fn initial_instructions() -> InstructionBatch {
                     rows: SYNTHETIC_ROWS,
                 }),
                 marker: None,
+                session_control: None,
             },
             Instruction {
                 bytes: Some(ByteRun {
@@ -77,6 +78,7 @@ fn initial_instructions() -> InstructionBatch {
                 }),
                 viewport: None,
                 marker: None,
+                session_control: None,
             },
         ],
     }

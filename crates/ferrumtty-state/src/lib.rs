@@ -2,7 +2,9 @@
 
 //! Cloneable remote terminal state for reconstructing SSP updates from history.
 
-use ferrumtty_wire::{ByteRun, Instruction, InstructionBatch, Marker, ViewportSize};
+use ferrumtty_wire::{
+    ByteRun, Instruction, InstructionBatch, Marker, SessionControl, ViewportSize,
+};
 use std::fmt;
 use std::sync::Arc;
 
@@ -16,6 +18,7 @@ pub const MAX_RETAINED_OPERATIONS: usize = 65_536;
 enum StateOperation {
     HostBytes(Vec<u8>),
     Resize { columns: u16, rows: u16 },
+    SessionControl(SessionControl),
 }
 
 struct HistoryNode {
@@ -122,7 +125,12 @@ impl RemoteTerminalState {
             echo_ack = Some(marker.value);
         }
 
-        self.validate_history_growth(batch)?;
+        if self.validate_history_growth(batch).is_err() {
+            let (history, initial_columns, initial_rows) = self.compacted_history(batch)?;
+            self.history = history;
+            self.initial_columns = initial_columns;
+            self.initial_rows = initial_rows;
+        }
 
         for instruction in &batch.instructions {
             if let Some(bytes) = &instruction.bytes {
@@ -136,6 +144,10 @@ impl RemoteTerminalState {
             }
             if let Some(marker) = instruction.marker {
                 self.echo_ack = Some(marker.value);
+            }
+            if let Some(session_control) = &instruction.session_control {
+                self.history
+                    .push(StateOperation::SessionControl(session_control.clone()));
             }
         }
         Ok(())
@@ -198,7 +210,12 @@ impl RemoteTerminalState {
                         let value = value[offset..].to_vec();
                         (!value.is_empty()).then_some(host_bytes_instruction(value))
                     }
-                    StateOperation::Resize { .. } => None,
+                    StateOperation::Resize { columns, rows } => {
+                        Some(viewport_instruction(*columns, *rows))
+                    }
+                    StateOperation::SessionControl(control) => {
+                        Some(session_control_instruction(control.clone()))
+                    }
                 })
                 .collect::<Vec<_>>(),
             Err(StateError::DivergedHistory)
@@ -224,6 +241,7 @@ impl RemoteTerminalState {
                         bytes: None,
                         viewport: None,
                         marker: Some(Marker { value }),
+                        session_control: None,
                     },
                 );
             }
@@ -255,38 +273,93 @@ impl RemoteTerminalState {
     }
 
     fn validate_history_growth(&self, batch: &InstructionBatch) -> Result<(), StateError> {
-        let mut additional_bytes = 0_usize;
-        let mut additional_operations = 0_usize;
-        let mut viewport = self.viewport;
-        for instruction in &batch.instructions {
-            if let Some(bytes) = &instruction.bytes {
-                additional_bytes = additional_bytes
-                    .checked_add(bytes.value.len())
-                    .ok_or(StateError::HistoryLimitExceeded)?;
-                additional_operations += usize::from(!bytes.value.is_empty());
-            }
-            if let Some(next_viewport) = instruction.viewport {
-                if viewport != next_viewport {
-                    additional_operations += 1;
-                    viewport = next_viewport;
-                }
-            }
-        }
-        let retained_bytes = self
-            .history
-            .retained_bytes
-            .checked_add(additional_bytes)
-            .ok_or(StateError::HistoryLimitExceeded)?;
-        let operation_count = self
-            .history
-            .operation_count
-            .checked_add(additional_operations)
-            .ok_or(StateError::HistoryLimitExceeded)?;
-        if retained_bytes > MAX_RETAINED_HOST_BYTES || operation_count > MAX_RETAINED_OPERATIONS {
+        let (additional_bytes, additional_operations) = history_growth(batch, self.viewport)?;
+        validate_history_size(
+            self.history.retained_bytes,
+            self.history.operation_count,
+            additional_bytes,
+            additional_operations,
+        )
+    }
+
+    fn compacted_history(
+        &self,
+        batch: &InstructionBatch,
+    ) -> Result<(StateHistory, u16, u16), StateError> {
+        if !history_ends_at_ground(&self.history.canonical_operations()) {
             return Err(StateError::HistoryLimitExceeded);
         }
-        Ok(())
+        let snapshot = self.screen().state_formatted();
+        let (additional_bytes, additional_operations) = history_growth(batch, self.viewport)?;
+        let snapshot_operations = usize::from(!snapshot.is_empty());
+        validate_history_size(
+            snapshot.len(),
+            snapshot_operations,
+            additional_bytes,
+            additional_operations,
+        )?;
+        let tail = (!snapshot.is_empty()).then(|| {
+            Arc::new(HistoryNode {
+                parent: None,
+                operation: StateOperation::HostBytes(snapshot.clone()),
+            })
+        });
+        let columns =
+            u16::try_from(self.viewport.columns).map_err(|_| StateError::InvalidViewport)?;
+        let rows = u16::try_from(self.viewport.rows).map_err(|_| StateError::InvalidViewport)?;
+        Ok((
+            StateHistory {
+                tail,
+                operation_count: snapshot_operations,
+                retained_bytes: snapshot.len(),
+            },
+            columns,
+            rows,
+        ))
     }
+}
+
+fn history_growth(
+    batch: &InstructionBatch,
+    initial_viewport: ViewportSize,
+) -> Result<(usize, usize), StateError> {
+    let mut additional_bytes = 0_usize;
+    let mut additional_operations = 0_usize;
+    let mut viewport = initial_viewport;
+    for instruction in &batch.instructions {
+        if let Some(bytes) = &instruction.bytes {
+            additional_bytes = additional_bytes
+                .checked_add(bytes.value.len())
+                .ok_or(StateError::HistoryLimitExceeded)?;
+            additional_operations += usize::from(!bytes.value.is_empty());
+        }
+        if let Some(next_viewport) = instruction.viewport {
+            if viewport != next_viewport {
+                additional_operations += 1;
+                viewport = next_viewport;
+            }
+        }
+        additional_operations += usize::from(instruction.session_control.is_some());
+    }
+    Ok((additional_bytes, additional_operations))
+}
+
+fn validate_history_size(
+    retained_bytes: usize,
+    operation_count: usize,
+    additional_bytes: usize,
+    additional_operations: usize,
+) -> Result<(), StateError> {
+    let retained_bytes = retained_bytes
+        .checked_add(additional_bytes)
+        .ok_or(StateError::HistoryLimitExceeded)?;
+    let operation_count = operation_count
+        .checked_add(additional_operations)
+        .ok_or(StateError::HistoryLimitExceeded)?;
+    if retained_bytes > MAX_RETAINED_HOST_BYTES || operation_count > MAX_RETAINED_OPERATIONS {
+        return Err(StateError::HistoryLimitExceeded);
+    }
+    Ok(())
 }
 
 fn host_bytes_instruction(value: Vec<u8>) -> Instruction {
@@ -294,6 +367,28 @@ fn host_bytes_instruction(value: Vec<u8>) -> Instruction {
         bytes: Some(ByteRun { value }),
         viewport: None,
         marker: None,
+        session_control: None,
+    }
+}
+
+fn viewport_instruction(columns: u16, rows: u16) -> Instruction {
+    Instruction {
+        bytes: None,
+        viewport: Some(ViewportSize {
+            columns: u64::from(columns),
+            rows: u64::from(rows),
+        }),
+        marker: None,
+        session_control: None,
+    }
+}
+
+fn session_control_instruction(session_control: SessionControl) -> Instruction {
+    Instruction {
+        bytes: None,
+        viewport: None,
+        marker: None,
+        session_control: Some(session_control),
     }
 }
 
@@ -307,6 +402,7 @@ impl Clone for RemoteTerminalState {
                 StateOperation::Resize { columns, rows } => {
                     cloned.parser.screen_mut().set_size(*rows, *columns);
                 }
+                StateOperation::SessionControl(_) => {}
             }
         }
         cloned.history = self.history.clone();
@@ -477,14 +573,24 @@ fn history_tail_is_screen_diff_safe(common: &[StateOperation], tail: &[StateOper
         match operation {
             StateOperation::HostBytes(bytes) => parser.advance(&mut audit, bytes),
             StateOperation::Resize { .. } => return false,
+            StateOperation::SessionControl(_) => {}
         }
     }
-    if !audit.reconstructible {
-        return false;
-    }
-
     // A printable probe is dispatched unchanged only when the VTE parser is
     // in ground state with no incomplete UTF-8 code point.
+    audit.begin_boundary_probe();
+    parser.advance(&mut audit, b"~");
+    audit.probe_is_ground()
+}
+
+fn history_ends_at_ground(operations: &[StateOperation]) -> bool {
+    let mut parser = vte::Parser::new();
+    let mut audit = ScreenDiffAudit::default();
+    for operation in operations {
+        if let StateOperation::HostBytes(bytes) = operation {
+            parser.advance(&mut audit, bytes);
+        }
+    }
     audit.begin_boundary_probe();
     parser.advance(&mut audit, b"~");
     audit.probe_is_ground()
@@ -652,6 +758,7 @@ mod tests {
                         rows: 40,
                     }),
                     marker: Some(Marker { value: 23 }),
+                    session_control: None,
                 }],
             })
             .expect("combined instruction must apply");
@@ -679,6 +786,7 @@ mod tests {
                     bytes: None,
                     viewport: None,
                     marker: Some(Marker { value: 41 }),
+                    session_control: None,
                 }],
             })
             .expect("marker applies");
@@ -755,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn diverged_completed_escape_state_remains_conservative() {
+    fn diverged_completed_escape_state_converges_through_screen_diff() {
         let mut left = state();
         left.apply(&bytes_batch(b"\x1b[31mleft"))
             .expect("styled text applies");
@@ -763,10 +871,15 @@ mod tests {
         right
             .apply(&bytes_batch(b"\x1b[32mright"))
             .expect("styled text applies");
-        assert!(matches!(
-            right.diff_from(&left),
-            Err(StateError::DivergedHistory)
-        ));
+        let diff = right
+            .diff_from(&left)
+            .expect("completed terminal states must converge");
+        left.apply(diff.instructions())
+            .expect("screen diff must apply");
+        assert_eq!(
+            left.screen().state_formatted(),
+            right.screen().state_formatted()
+        );
     }
 
     #[test]
@@ -804,6 +917,24 @@ mod tests {
         assert!(state.screen().contents().is_empty());
     }
 
+    #[test]
+    fn long_running_ground_state_output_compacts_history() {
+        let mut state = state();
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..17 {
+            state
+                .apply(&bytes_batch(&chunk))
+                .expect("completed output must compact instead of ending the session");
+        }
+
+        assert!(state.retained_bytes() <= MAX_RETAINED_HOST_BYTES);
+        let cloned = state.clone();
+        assert_eq!(
+            cloned.screen().state_formatted(),
+            state.screen().state_formatted()
+        );
+    }
+
     fn state() -> RemoteTerminalState {
         RemoteTerminalState::new(80, 24).expect("test viewport is valid")
     }
@@ -816,6 +947,7 @@ mod tests {
                 }),
                 viewport: None,
                 marker: None,
+                session_control: None,
             }],
         }
     }

@@ -7,6 +7,7 @@ const FRAGMENT_HEADER_BYTES: usize = 14;
 const FINAL_FRAGMENT_BIT: u16 = 1_u16 << 15;
 const FRAGMENT_INDEX_MASK: u16 = FINAL_FRAGMENT_BIT - 1;
 pub const MAX_FRAGMENT_BODY_BYTES: usize = 1214;
+const MAX_RECEIVED_FRAGMENT_BODY_BYTES: usize = 1300;
 
 /// Metadata outside the compressed state message but inside authentication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,8 +41,8 @@ impl Fragment {
     ///
     /// # Errors
     ///
-    /// Returns an error when the plaintext is shorter than the prefix or a
-    /// non-final fragment does not use the observed full body size.
+    /// Returns an error when the plaintext is shorter than the prefix or its
+    /// body exceeds the largest size emitted by the supported peers.
     pub fn parse(plaintext: &[u8]) -> Result<Self, FragmentError> {
         let header_bytes = plaintext
             .get(..FRAGMENT_HEADER_BYTES)
@@ -59,11 +60,8 @@ impl Fragment {
             is_final: fragment_word & FINAL_FRAGMENT_BIT != 0,
         };
         let body = plaintext[FRAGMENT_HEADER_BYTES..].to_vec();
-        if body.len() > MAX_FRAGMENT_BODY_BYTES {
+        if body.len() > MAX_RECEIVED_FRAGMENT_BODY_BYTES {
             return Err(FragmentError::BodyTooLarge);
-        }
-        if !header.is_final && body.len() != MAX_FRAGMENT_BODY_BYTES {
-            return Err(FragmentError::ShortNonFinalBody);
         }
         Ok(Self { header, body })
     }
@@ -126,7 +124,9 @@ impl Fragment {
         } else {
             0
         };
-        output.extend_from_slice(&(self.header.index | final_bit).to_be_bytes());
+        output.extend_from_slice(
+            &((self.header.index & FRAGMENT_INDEX_MASK) | final_bit).to_be_bytes(),
+        );
         output.extend_from_slice(&self.body);
         output
     }
@@ -230,7 +230,6 @@ impl FragmentAccumulator {
 pub enum FragmentError {
     HeaderTooShort,
     BodyTooLarge,
-    ShortNonFinalBody,
     TooManyFragments,
     MismatchedState,
     IndexAfterFinal,
@@ -291,6 +290,34 @@ mod tests {
         assert_eq!(fragment.header.index, 0);
         assert!(!fragment.header.is_final);
         assert_eq!(fragment.encode(), plaintext);
+    }
+
+    #[test]
+    fn accepts_supported_peer_fragment_sizes() {
+        for body_bytes in [1178, MAX_FRAGMENT_BODY_BYTES, 1300] {
+            let mut plaintext = vec![0; 14 + body_bytes];
+            plaintext[12..14].copy_from_slice(&0_u16.to_be_bytes());
+            let fragment = Fragment::parse(&plaintext).expect("peer fragment must parse");
+            assert_eq!(fragment.body.len(), body_bytes);
+            assert!(!fragment.header.is_final);
+        }
+    }
+
+    #[test]
+    fn encoding_masks_the_reserved_final_bit_from_the_index() {
+        let fragment = Fragment {
+            header: super::FragmentHeader {
+                sent_timestamp: 1,
+                echoed_timestamp: 2,
+                state_id: 3,
+                index: 0x8001,
+                is_final: false,
+            },
+            body: Vec::new(),
+        };
+        let parsed = Fragment::parse(&fragment.encode()).expect("fragment must parse");
+        assert_eq!(parsed.header.index, 1);
+        assert!(!parsed.header.is_final);
     }
 
     #[test]

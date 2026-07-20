@@ -18,6 +18,8 @@ const MAXIMUM_RECEIVED_STATES: usize = 1_024;
 const REPLAY_WINDOW_BITS: u64 = 128;
 const DEFAULT_REMOTE_COLUMNS: u16 = 80;
 const DEFAULT_REMOTE_ROWS: u16 = 24;
+const TIMESTAMP_HEADER_BYTES: usize = 4;
+const MINIMUM_FRAGMENT_PLAINTEXT_BYTES: usize = 14;
 
 /// Produces authenticated client updates and accepts authenticated server states.
 pub struct ClientProtocol {
@@ -31,6 +33,8 @@ pub struct ClientProtocol {
     received_states: BTreeMap<u64, RemoteTerminalState>,
     delivered_remote_state: RemoteTerminalState,
     remote_throwaway_floor: u64,
+    local_capabilities: Vec<u8>,
+    remote_capabilities: Vec<u8>,
     replay_window: ReplayWindow,
 }
 
@@ -55,8 +59,72 @@ impl ClientProtocol {
             received_states: BTreeMap::from([(0, initial_remote_state.clone())]),
             delivered_remote_state: initial_remote_state,
             remote_throwaway_floor: 0,
+            local_capabilities: Vec::new(),
+            remote_capabilities: Vec::new(),
             replay_window: ReplayWindow::default(),
         }
+    }
+
+    /// Builds the initial empty state-zero datagram used to associate a client endpoint.
+    ///
+    /// This packet does not advance local SSP state or create retransmission history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compression, fragmentation, or authenticated encryption fails.
+    pub fn build_association(&mut self, sent_timestamp: u16) -> Result<Vec<Vec<u8>>, SessionError> {
+        self.build_acknowledgement(sent_timestamp)
+    }
+
+    /// Builds an empty acknowledgement or heartbeat without advancing local SSP state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if state history, compression, fragmentation, or encryption fails.
+    pub fn build_acknowledgement(
+        &mut self,
+        sent_timestamp: u16,
+    ) -> Result<Vec<Vec<u8>>, SessionError> {
+        let local_state = self
+            .sent_states
+            .back()
+            .ok_or(SessionError::StateHistoryUnavailable)?
+            .state_id;
+        let mut update = StateUpdate::new(local_state, local_state, self.latest_remote_state);
+        update.discard_before = self
+            .sent_states
+            .front()
+            .ok_or(SessionError::StateHistoryUnavailable)?
+            .state_id;
+        update.capabilities.clone_from(&self.local_capabilities);
+        let compressed = encode_compressed_update(&update).map_err(SessionError::Message)?;
+        seal_fragments(
+            &mut self.secure_channel,
+            &compressed,
+            sent_timestamp,
+            self.latest_peer_timestamp,
+            local_state,
+        )
+    }
+
+    /// Sets extension capability bytes advertised on subsequent updates.
+    pub fn set_local_capabilities(&mut self, capabilities: Vec<u8>) {
+        self.local_capabilities = capabilities;
+    }
+
+    /// Returns the latest non-empty capability advertisement from the peer.
+    #[must_use]
+    pub fn remote_capabilities(&self) -> &[u8] {
+        &self.remote_capabilities
+    }
+
+    /// Reports whether both peers advertise the requested first-byte capability bit.
+    #[must_use]
+    pub fn has_negotiated_capability(&self, capability: u8) -> bool {
+        self.local_capabilities
+            .first()
+            .zip(self.remote_capabilities.first())
+            .is_some_and(|(local, remote)| local & remote & capability != 0)
     }
 
     /// Encodes one client state update and returns one or more UDP payloads.
@@ -112,6 +180,7 @@ impl ClientProtocol {
         }
         let mut update = StateUpdate::new(u64::MAX, u64::MAX, self.latest_remote_state);
         update.discard_before = u64::MAX;
+        update.capabilities.clone_from(&self.local_capabilities);
         update.delta = InstructionBatch {
             instructions: Vec::new(),
         }
@@ -150,6 +219,7 @@ impl ClientProtocol {
         let mut update = StateUpdate::new(base_state, target_state, self.latest_remote_state);
         update.discard_before = discard_before;
         update.delta = instructions.encode_bytes();
+        update.capabilities.clone_from(&self.local_capabilities);
         let compressed = encode_compressed_update(&update).map_err(SessionError::Message)?;
         let packets = seal_fragments(
             &mut self.secure_channel,
@@ -202,6 +272,7 @@ impl ClientProtocol {
         );
         update.discard_before = confirmed.state_id;
         update.delta = instructions.encode_bytes();
+        update.capabilities.clone_from(&self.local_capabilities);
         let compressed = encode_compressed_update(&update).map_err(SessionError::Message)?;
         seal_fragments(
             &mut self.secure_channel,
@@ -217,8 +288,19 @@ impl ClientProtocol {
     /// # Errors
     ///
     /// Returns an error for failed authentication, invalid fragments, bounded
-    /// reassembly failures, invalid messages, or mismatched state identifiers.
+    /// reassembly failures or invalid messages.
     pub fn ingest(&mut self, packet: &[u8]) -> Result<Option<ReceivedState>, SessionError> {
+        self.ingest_packet(packet).map(|receipt| receipt.state)
+    }
+
+    /// Accepts one UDP payload and reports every authenticated packet, including
+    /// timestamp-only heartbeats and incomplete fragmented messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for failed authentication, replay, framing, bounded
+    /// reassembly failures or invalid messages.
+    pub fn ingest_packet(&mut self, packet: &[u8]) -> Result<PacketReceipt, SessionError> {
         let authenticated = self
             .secure_channel
             .open(packet)
@@ -226,9 +308,23 @@ impl ClientProtocol {
         if !self.replay_window.accept(authenticated.counter) {
             return Err(SessionError::ReplayDetected);
         }
+        let timestamp_header = authenticated
+            .plaintext
+            .get(..TIMESTAMP_HEADER_BYTES)
+            .ok_or(SessionError::Fragment(FragmentError::HeaderTooShort))?;
+        let sent_timestamp = u16::from_be_bytes([timestamp_header[0], timestamp_header[1]]);
+        let echoed_timestamp = u16::from_be_bytes([timestamp_header[2], timestamp_header[3]]);
+        self.latest_peer_timestamp = Some(sent_timestamp);
+        if authenticated.plaintext.len() < MINIMUM_FRAGMENT_PLAINTEXT_BYTES {
+            return Ok(PacketReceipt {
+                packet_counter: authenticated.counter,
+                sent_timestamp,
+                echoed_timestamp,
+                state: None,
+            });
+        }
         let fragment = Fragment::parse(&authenticated.plaintext).map_err(SessionError::Fragment)?;
         let header = fragment.header;
-        self.latest_peer_timestamp = Some(header.sent_timestamp);
         if !self.assemblies.contains_key(&header.state_id)
             && self.assemblies.len() >= MAXIMUM_ACTIVE_ASSEMBLIES
         {
@@ -238,22 +334,34 @@ impl ClientProtocol {
             FragmentAccumulator::new(header.state_id, MAXIMUM_REASSEMBLED_BYTES)
         });
         let Some(compressed) = assembly.push(fragment).map_err(SessionError::Fragment)? else {
-            return Ok(None);
+            return Ok(PacketReceipt {
+                packet_counter: authenticated.counter,
+                sent_timestamp,
+                echoed_timestamp,
+                state: None,
+            });
         };
         self.assemblies.remove(&header.state_id);
         let update = decode_compressed_update(&compressed).map_err(SessionError::Message)?;
-        if update.target_state != header.state_id {
-            return Err(SessionError::Fragment(FragmentError::MismatchedState));
-        }
+        let remote_capabilities = update.capabilities.clone();
         self.process_acknowledgement(update.acknowledged_state);
         let (advances_remote_state, delivered_update) = self.accept_remote_update(update)?;
-        Ok(Some(ReceivedState {
+        if !remote_capabilities.is_empty() {
+            self.remote_capabilities = remote_capabilities;
+        }
+        let state = ReceivedState {
             packet_counter: authenticated.counter,
             sent_timestamp: header.sent_timestamp,
             echoed_timestamp: header.echoed_timestamp,
             advances_remote_state,
             update: delivered_update,
-        }))
+        };
+        Ok(PacketReceipt {
+            packet_counter: authenticated.counter,
+            sent_timestamp,
+            echoed_timestamp,
+            state: Some(state),
+        })
     }
 
     #[must_use]
@@ -452,6 +560,27 @@ fn seal_fragments(
         .collect()
 }
 
+/// Metadata observed from every authenticated server packet.
+#[derive(PartialEq)]
+pub struct PacketReceipt {
+    pub packet_counter: u64,
+    pub sent_timestamp: u16,
+    pub echoed_timestamp: u16,
+    pub state: Option<ReceivedState>,
+}
+
+impl std::fmt::Debug for PacketReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PacketReceipt")
+            .field("packet_counter", &self.packet_counter)
+            .field("sent_timestamp", &self.sent_timestamp)
+            .field("echoed_timestamp", &self.echoed_timestamp)
+            .field("has_state", &self.state.is_some())
+            .finish()
+    }
+}
+
 #[derive(PartialEq)]
 pub struct ReceivedState {
     pub packet_counter: u64,
@@ -526,6 +655,33 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_heartbeat_is_observed_and_echoed_without_a_state() {
+        let mut client = ClientProtocol::new(key());
+        let mut server = SecureChannel::new(PeerRole::Server, key());
+        let heartbeat = server
+            .seal_next(&[0x12, 0x34, 0x43, 0x21])
+            .expect("heartbeat must seal");
+
+        let receipt = client
+            .ingest_packet(&heartbeat)
+            .expect("heartbeat must authenticate");
+        assert_eq!(receipt.sent_timestamp, 0x1234);
+        assert_eq!(receipt.echoed_timestamp, 0x4321);
+        assert!(receipt.state.is_none());
+        assert!(!format!("{receipt:?}").contains("payload"));
+
+        let acknowledgement = client
+            .build_acknowledgement(0x5678)
+            .expect("acknowledgement must encode");
+        let plaintext = SecureChannel::new(PeerRole::Server, key())
+            .open(&acknowledgement[0])
+            .expect("acknowledgement must authenticate")
+            .plaintext;
+        let fragment = Fragment::parse(&plaintext).expect("acknowledgement must contain a state");
+        assert_eq!(fragment.header.echoed_timestamp, 0x1234);
+    }
+
+    #[test]
     fn initial_update_matches_observed_state_shape() {
         let mut client = ClientProtocol::new(
             SessionKey::decode(SYNTHETIC_KEY).expect("synthetic key must decode"),
@@ -537,6 +693,7 @@ mod tests {
                 }),
                 viewport: None,
                 marker: None,
+                session_control: None,
             }],
         };
         let packets = client
@@ -827,19 +984,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fragment_identifier_that_differs_from_target_state() {
+    fn accepts_fragment_identifier_independent_of_target_state() {
         let mut client = ClientProtocol::new(key());
         let mut server = SecureChannel::new(PeerRole::Server, key());
         let update = StateUpdate::new(0, 1, 0);
         let packet = server_update_packet(&mut server, &update, 2);
 
-        assert!(matches!(
-            client.ingest(&packet),
-            Err(super::SessionError::Fragment(
-                ferrumtty_wire::FragmentError::MismatchedState
-            ))
-        ));
-        assert_eq!(client.latest_remote_state(), 0);
+        let received = client
+            .ingest(&packet)
+            .expect("independent fragment identifier must be accepted")
+            .expect("complete update must be delivered");
+        assert_eq!(received.update.target_state, 1);
+        assert_eq!(client.latest_remote_state(), 1);
     }
 
     #[test]
@@ -911,6 +1067,7 @@ mod tests {
                 }),
                 viewport: None,
                 marker: None,
+                session_control: None,
             }],
         };
         let mut server_update = StateUpdate::new(0, 2, 1);
@@ -1028,6 +1185,7 @@ mod tests {
                 }),
                 viewport: None,
                 marker: None,
+                session_control: None,
             }],
         }
     }

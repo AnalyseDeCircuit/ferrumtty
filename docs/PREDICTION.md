@@ -5,12 +5,12 @@ state, acknowledged state, the authoritative terminal model, or outgoing input.
 
 Eligibility is intentionally narrow:
 
-- consecutive single-column printable ASCII key events are eligible;
+- consecutive single-scalar printable UTF-8 key events are eligible;
 - Backspace may cancel only the last unacknowledged local printable prediction;
-- unmodified left and right movement stays within the current predicted ASCII
+- unmodified left and right movement stays within the current predicted
   span;
-- UTF-8 multibyte characters, combining characters, controls, escape
-  sequences, function keys, mouse, focus, and all paste events are ineligible;
+- controls, escape sequences, function keys, mouse, focus, multi-scalar input,
+  and all paste events are ineligible;
 - eligible characters are rendered with underline rendition as an explicit
   visual indication;
 - resize, authoritative server output, termination, and any error reconcile

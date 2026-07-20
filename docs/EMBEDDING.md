@@ -5,9 +5,10 @@ convergence, acknowledgements, retransmission timing, heartbeat timing, input
 bounds, and the ephemeral key after construction. It does not open sockets,
 read clocks, inspect terminal devices, or start SSH.
 
-`EMBEDDING_API_VERSION` identifies the current host-action contract. The API
-remains pre-release, so hosts should check this value instead of assuming that
-all `0.0.0` builds expose identical events.
+`EMBEDDING_API_VERSION` identifies the current host-action contract. Version 5
+adds peer capability, optional session-control, and authoritative resize
+actions. The API remains pre-release, so hosts should check this value instead
+of assuming that all `0.0.0` builds expose identical events.
 
 The host must:
 
@@ -36,6 +37,11 @@ state separately from any following `WriteTerminal` effects.
 `SessionAction::ConnectionStateChanged` distinguishes a session
 that has never connected from a connected session that is temporarily
 interrupted. `SessionAction::RoundTripEstimate` reports changed RTT estimates.
+`SessionAction::CapabilitiesChanged` reports the latest non-empty peer
+capability advertisement. `SessionAction::RemoteSessionControl` carries the
+optional mosh-go field-9 extension and is never terminal output.
+`SessionAction::ResizeTerminal` reports an authoritative remote viewport
+transition in instruction order.
 `SessionAction::SessionLifecycleChanged` reports explicit host pause, resume,
 and cancellation transitions. `SessionAction::UdpBindingChanged` reports the
 monotonic generation returned after a host-managed local UDP rebind; it does
@@ -66,11 +72,24 @@ protocol payload types directly.
 terminating the session; the host may display connection state while continuing
 to poll and send heartbeats so Mosh can recover later.
 
-Local input can advance through multiple unacknowledged SSP states. A timeout
-rebuilds the latest logical input suffix from the highest exactly acknowledged
-state and reseals it with fresh packet counters. Retransmitted or stale server
-states may still acknowledge local state, but their terminal instructions are
-not applied twice.
+The first poll emits an empty state-zero association datagram before any queued
+state. At most one unacknowledged input state is in flight; input and resize
+events queued behind it remain ordered and are sent together after an exact
+acknowledgement. Retransmission and idle heartbeat scheduling use the echoed
+timestamp RTT estimate with a 250 ms to 10 s bound. Retransmitted or stale
+server states may still acknowledge local state, but their terminal
+instructions are not applied twice.
+
+Authenticated timestamp-only heartbeats and incomplete message fragments update
+liveness, timestamp echo, and RTT observations without producing terminal
+actions. This matches mosh-go's transport-level packet accounting while keeping
+state delivery dependent on successful reassembly.
+
+For mosh-go-style embedding, call `set_local_capabilities` before the first
+poll, use `queue_session_control` only after `has_negotiated_capability` becomes
+true, and use `receive_datagram_lossy` when packet failures should be silently
+dropped. The stricter `receive_datagram` remains available to hosts that need
+structured protocol failures.
 
 The host must not persist the session key, terminal content, plaintext packet
 payloads, or generated datagrams. A host may change its local UDP address while
